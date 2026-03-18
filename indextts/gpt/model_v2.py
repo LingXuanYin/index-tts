@@ -4,8 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import transformers
-from transformers import GPT2Config, LogitsProcessorList
+from transformers.generation.logits_process import LogitsProcessorList
+from transformers.models.gpt2.configuration_gpt2 import GPT2Config
 from indextts.gpt.transformers_gpt2 import GPT2PreTrainedModel, GPT2Model
 
 # from transformers import GPT2Config, GPT2PreTrainedModel, LogitsProcessorList
@@ -259,7 +259,7 @@ def build_hf_gpt_transformer(layers, model_dim, heads, max_mel_seq_len, max_text
     """
     GPT-2 implemented by the HuggingFace library.
     """
-    from transformers import GPT2Config, GPT2Model
+    from transformers.models.gpt2.configuration_gpt2 import GPT2Config
     gpt_config = GPT2Config(vocab_size=256,  # Unused.
                             n_positions=max_mel_seq_len + max_text_seq_len,
                             n_ctx=max_mel_seq_len + max_text_seq_len,
@@ -696,7 +696,7 @@ class UnifiedVoice(nn.Module):
         return fake_inputs, batched_mel_emb, attention_mask
 
     def inference_speech(self, speech_condition, text_inputs, emo_speech_condition=None, cond_lengths=None, emo_cond_lengths=None, emo_vec=None, use_speed=False, input_tokens=None, num_return_sequences=1,
-                         max_generate_length=None, typical_sampling=False, typical_mass=.9, **hf_generate_kwargs):
+                         max_generate_length=None, typical_sampling=False, typical_mass=.9, speech_conditioning_latent_override=None, **hf_generate_kwargs):
         """
         Args:
             speech_condition: (b, d, frames) or (d, frames)
@@ -716,7 +716,10 @@ class UnifiedVoice(nn.Module):
         if emo_cond_lengths is None:
             emo_cond_lengths = torch.tensor([emo_speech_condition.shape[-1]], device=speech_condition.device) 
 
-        speech_conditioning_latent = self.get_conditioning(speech_condition.transpose(1,2), cond_lengths)
+        if speech_conditioning_latent_override is None:
+            speech_conditioning_latent = self.get_conditioning(speech_condition.transpose(1,2), cond_lengths)
+        else:
+            speech_conditioning_latent = speech_conditioning_latent_override
         if emo_vec is None:
             print('compute emo vec')
             emo_vec = self.get_emo_conditioning(emo_speech_condition.transpose(1,2), emo_cond_lengths)

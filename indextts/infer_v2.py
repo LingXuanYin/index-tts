@@ -2,13 +2,16 @@ import os
 from subprocess import CalledProcessError
 
 os.environ['HF_HUB_CACHE'] = './checkpoints/hf_cache'
+if os.name == "nt":
+    os.environ.setdefault("PYTORCH_JIT", "0")
 import json
 import re
 import time
-import librosa
 import torch
 import torchaudio
+import librosa
 from torch.nn.utils.rnn import pad_sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import warnings
 
@@ -27,13 +30,25 @@ from indextts.s2mel.modules.bigvgan import bigvgan
 from indextts.s2mel.modules.campplus.DTDNN import CAMPPlus
 from indextts.s2mel.modules.audio import mel_spectrogram
 
-from transformers import AutoTokenizer
-from modelscope import AutoModelForCausalLM
 from huggingface_hub import hf_hub_download
 import safetensors
-from transformers import SeamlessM4TFeatureExtractor
+from transformers.models.auto.tokenization_auto import AutoTokenizer
+from transformers.models.seamless_m4t.feature_extraction_seamless_m4t import SeamlessM4TFeatureExtractor
 import random
 import torch.nn.functional as F
+
+from indextts.fusion import (
+    EXPERIMENTAL_FUSION_LEVELS,
+    SUPPORTED_FUSION_LEVELS,
+    FusionRecipe,
+    branch_anchor_mode,
+    branch_operator,
+    branch_references,
+    coerce_fusion_recipe,
+    normalize_weights,
+    recipe_cache_token,
+    recipe_metadata,
+)
 
 class IndexTTS2:
     def __init__(
@@ -80,7 +95,8 @@ class IndexTTS2:
         self.use_accel = use_accel
         self.use_torch_compile = use_torch_compile
 
-        self.qwen_emo = QwenEmotion(os.path.join(self.model_dir, self.cfg.qwen_emo_path))
+        self.qwen_emo = None
+        self.qwen_emo_dir = os.path.join(self.model_dir, self.cfg.qwen_emo_path)
 
         self.gpt = UnifiedVoice(**self.cfg.gpt, use_accel=self.use_accel)
         self.gpt_path = os.path.join(self.model_dir, self.cfg.gpt_checkpoint)
@@ -202,6 +218,10 @@ class IndexTTS2:
         self.mel_fn = lambda x: mel_spectrogram(x, **mel_fn_args)
 
         # 缓存参考音频：
+        self.reference_conditioning_cache: Dict[str, Dict[str, torch.Tensor]] = {}
+        self.emotion_conditioning_cache: Dict[str, torch.Tensor] = {}
+        self.last_inference_metadata: Dict[str, Any] = {}
+
         self.cache_spk_cond = None
         self.cache_s2mel_style = None
         self.cache_s2mel_prompt = None
@@ -214,6 +234,11 @@ class IndexTTS2:
         self.gr_progress = None
         self.model_version = self.cfg.version if hasattr(self.cfg, "version") else None
 
+    def _get_qwen_emo(self):
+        if self.qwen_emo is None:
+            self.qwen_emo = QwenEmotion(self.qwen_emo_dir)
+        return self.qwen_emo
+
     @torch.no_grad()
     def get_emb(self, input_features, attention_mask):
         vq_emb = self.semantic_model(
@@ -224,6 +249,519 @@ class IndexTTS2:
         feat = vq_emb.hidden_states[17]  # (B, T, C)
         feat = (feat - self.semantic_mean) / self.semantic_std
         return feat
+
+    def _resample_audio(self, audio: torch.Tensor, source_sr: int, target_sr: int) -> torch.Tensor:
+        if source_sr == target_sr:
+            return audio
+        return torchaudio.functional.resample(audio, source_sr, target_sr)
+
+    def _prepare_audio_variants(self, audio: torch.Tensor, source_sr: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self._resample_audio(audio, source_sr, 16000), self._resample_audio(audio, source_sr, 22050)
+
+    def _build_reference_conditioning_from_audio(
+        self,
+        audio: torch.Tensor,
+        source_sr: int,
+        cache_key: str,
+        verbose: bool = False,
+        source_path: Optional[str] = None,
+    ) -> Dict[str, torch.Tensor]:
+        if cache_key in self.reference_conditioning_cache:
+            cached = self.reference_conditioning_cache[cache_key]
+            return {key: value for key, value in cached.items()}
+
+        audio_16k, audio_22k = self._prepare_audio_variants(audio, source_sr)
+        inputs = self.extract_features(audio_16k, sampling_rate=16000, return_tensors="pt")
+        input_features = inputs["input_features"].to(self.device)
+        attention_mask = inputs["attention_mask"].to(self.device)
+        spk_cond_emb = self.get_emb(input_features, attention_mask)
+
+        _, s_ref = self.semantic_codec.quantize(spk_cond_emb)
+        ref_mel = self.mel_fn(audio_22k.to(spk_cond_emb.device).float())
+        ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(ref_mel.device)
+        feat = torchaudio.compliance.kaldi.fbank(
+            audio_16k.to(ref_mel.device),
+            num_mel_bins=80,
+            dither=0,
+            sample_frequency=16000,
+        )
+        feat = feat - feat.mean(dim=0, keepdim=True)
+        style = self.campplus_model(feat.unsqueeze(0))
+        prompt_condition = self.s2mel.models["length_regulator"](
+            s_ref,
+            ylens=ref_target_lengths,
+            n_quantizers=3,
+            f0=None,
+        )[0]
+        speech_conditioning_latent = self.gpt.get_conditioning(
+            spk_cond_emb.transpose(1, 2),
+            torch.tensor([spk_cond_emb.shape[-1]], device=spk_cond_emb.device),
+        )
+
+        bundle = {
+            "spk_cond_emb": spk_cond_emb,
+            "speech_conditioning_latent": speech_conditioning_latent,
+            "prompt_condition": prompt_condition,
+            "style": style,
+            "ref_mel": ref_mel,
+            "cond_length": torch.tensor([spk_cond_emb.shape[-1]], device=spk_cond_emb.device),
+            "source_path": source_path or cache_key,
+        }
+        self.reference_conditioning_cache[cache_key] = bundle
+        return {key: value for key, value in bundle.items()}
+
+    def _get_reference_conditioning(
+        self,
+        audio_path: str,
+        verbose: bool = False,
+        cache_key: Optional[str] = None,
+    ) -> Dict[str, torch.Tensor]:
+        if cache_key is None:
+            cache_key = audio_path
+        audio, sr = self._load_and_cut_audio(audio_path, 15, verbose)
+        return self._build_reference_conditioning_from_audio(
+            audio,
+            sr,
+            cache_key=cache_key,
+            verbose=verbose,
+            source_path=audio_path,
+        )
+
+    def _get_emotion_conditioning(
+        self,
+        emo_audio_prompt: str,
+        verbose: bool = False,
+        cache_key: Optional[str] = None,
+    ) -> torch.Tensor:
+        if cache_key is None:
+            cache_key = emo_audio_prompt
+        if cache_key in self.emotion_conditioning_cache:
+            return self.emotion_conditioning_cache[cache_key]
+
+        emo_audio, _ = self._load_and_cut_audio(emo_audio_prompt, 15, verbose, sr=16000)
+        emo_inputs = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
+        emo_input_features = emo_inputs["input_features"].to(self.device)
+        emo_attention_mask = emo_inputs["attention_mask"].to(self.device)
+        emo_cond_emb = self.get_emb(emo_input_features, emo_attention_mask)
+        self.emotion_conditioning_cache[cache_key] = emo_cond_emb
+        return emo_cond_emb
+
+    def _build_emotion_conditioning_from_audio(
+        self,
+        audio: torch.Tensor,
+        source_sr: int,
+        cache_key: str,
+        verbose: bool = False,
+    ) -> torch.Tensor:
+        if cache_key in self.emotion_conditioning_cache:
+            return self.emotion_conditioning_cache[cache_key]
+
+        emo_audio = self._resample_audio(audio, source_sr, 16000)
+        emo_inputs = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
+        emo_input_features = emo_inputs["input_features"].to(self.device)
+        emo_attention_mask = emo_inputs["attention_mask"].to(self.device)
+        emo_cond_emb = self.get_emb(emo_input_features, emo_attention_mask)
+        self.emotion_conditioning_cache[cache_key] = emo_cond_emb
+        return emo_cond_emb
+
+    def _resolve_emotion_conditioning(
+        self,
+        emo_audio_prompt: str,
+        fusion_recipe: Optional[FusionRecipe],
+        verbose: bool = False,
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        if fusion_recipe is None:
+            emo_cond_emb = self._get_emotion_conditioning(emo_audio_prompt, verbose=verbose)
+            return emo_cond_emb, {
+                "references": [emo_audio_prompt],
+                "weights": [1.0],
+                "anchor_mode": "first",
+                "operator": "identity",
+                "field": "emo_cond_emb",
+            }
+
+        references = branch_references(fusion_recipe, "emotion")
+        if not references:
+            emo_cond_emb = self._get_emotion_conditioning(emo_audio_prompt, verbose=verbose)
+            return emo_cond_emb, {
+                "references": [emo_audio_prompt],
+                "weights": [1.0],
+                "anchor_mode": "first",
+                "operator": "identity",
+                "field": "emo_cond_emb",
+            }
+
+        anchor_mode = branch_anchor_mode(fusion_recipe, "emotion")
+        operator = branch_operator(fusion_recipe, "emotion")
+        if len(references) == 1:
+            emo_cond_emb = self._get_emotion_conditioning(
+                references[0].path,
+                verbose=verbose,
+                cache_key=recipe_cache_token(fusion_recipe, "emotion", {"path": references[0].path}),
+            )
+            return emo_cond_emb, {
+                "references": [references[0].path],
+                "weights": [1.0],
+                "anchor_mode": anchor_mode,
+                "operator": "identity",
+                "field": "emo_cond_emb",
+            }
+
+        weights = normalize_weights(tuple(references))
+        if self._field_level_enabled(fusion_recipe, "emotion", "waveform"):
+            mixed_audio, mixed_sr = self._mix_reference_waveforms(references, anchor_mode, verbose=verbose)
+            emo_cond_emb = self._build_emotion_conditioning_from_audio(
+                mixed_audio,
+                mixed_sr,
+                cache_key=recipe_cache_token(fusion_recipe, "emotion", {"mixed": True, "field": "emo_cond_emb"}),
+                verbose=verbose,
+            )
+            return emo_cond_emb, {
+                "references": [reference.path for reference in references],
+                "weights": weights,
+                "anchor_mode": anchor_mode,
+                "operator": "waveform_mix",
+                "field": "emo_cond_emb",
+            }
+
+        tensors = [
+            self._get_emotion_conditioning(
+                reference.path,
+                verbose=verbose,
+                cache_key=recipe_cache_token(fusion_recipe, "emotion", {"path": reference.path, "field": "emo_cond_emb"}),
+            )
+            for reference in references
+        ]
+        merged = self._weighted_merge(tensors, weights, "time_major", anchor_mode)
+        return merged, {
+            "references": [reference.path for reference in references],
+            "weights": weights,
+            "anchor_mode": anchor_mode,
+            "operator": operator,
+            "field": "emo_cond_emb",
+        }
+
+    def _select_anchor_index(self, count: int, anchor_mode: str, weights: Sequence[float]) -> int:
+        if count <= 1:
+            return 0
+        mode = (anchor_mode or "symmetric").lower()
+        if mode in {"a", "first"}:
+            return 0
+        if mode in {"b", "second"}:
+            return 1 if count > 1 else 0
+        if mode == "last":
+            return count - 1
+        if mode == "heaviest":
+            return int(max(range(count), key=lambda idx: weights[idx]))
+        return 0
+
+    def _resolve_target_length(self, lengths: Sequence[int], anchor_mode: str, weights: Sequence[float]) -> int:
+        if not lengths:
+            raise ValueError("Cannot resolve target length for an empty tensor list.")
+        mode = (anchor_mode or "symmetric").lower()
+        if mode in {"a", "first", "b", "second", "last", "heaviest"}:
+            return int(lengths[self._select_anchor_index(len(lengths), anchor_mode, weights)])
+        if mode == "longest":
+            return int(max(lengths))
+        if mode == "shortest":
+            return int(min(lengths))
+        weighted = sum(length * weight for length, weight in zip(lengths, weights))
+        return max(1, int(round(weighted)))
+
+    def _resize_time_major(self, tensor: torch.Tensor, target_len: int) -> torch.Tensor:
+        if tensor.size(1) == target_len:
+            return tensor
+        resized = F.interpolate(
+            tensor.transpose(1, 2),
+            size=target_len,
+            mode="linear",
+            align_corners=False,
+        )
+        return resized.transpose(1, 2)
+
+    def _resize_channel_major(self, tensor: torch.Tensor, target_len: int) -> torch.Tensor:
+        if tensor.size(-1) == target_len:
+            return tensor
+        return F.interpolate(tensor, size=target_len, mode="linear", align_corners=False)
+
+    def _weighted_merge(
+        self,
+        tensors: Sequence[torch.Tensor],
+        weights: Sequence[float],
+        time_layout: Optional[str],
+        anchor_mode: str,
+    ) -> torch.Tensor:
+        if len(tensors) == 1:
+            return tensors[0]
+        if time_layout == "time_major":
+            target_len = self._resolve_target_length(
+                [tensor.size(1) for tensor in tensors], anchor_mode, weights
+            )
+            tensors = [self._resize_time_major(tensor, target_len) for tensor in tensors]
+        elif time_layout == "channel_major":
+            target_len = self._resolve_target_length(
+                [tensor.size(-1) for tensor in tensors], anchor_mode, weights
+            )
+            tensors = [self._resize_channel_major(tensor, target_len) for tensor in tensors]
+
+        merged = torch.zeros_like(tensors[0])
+        for weight, tensor in zip(weights, tensors):
+            merged = merged + tensor * float(weight)
+        return merged
+
+    def _mix_reference_waveforms(
+        self,
+        references,
+        anchor_mode: str,
+        verbose: bool = False,
+    ) -> Tuple[torch.Tensor, int]:
+        waves: List[torch.Tensor] = []
+        weights = normalize_weights(tuple(references))
+        for reference in references:
+            audio, sr = self._load_and_cut_audio(reference.path, 15, verbose, sr=22050)
+            waves.append(audio)
+
+        target_len = self._resolve_target_length(
+            [wave.size(-1) for wave in waves], anchor_mode, weights
+        )
+        resized = [
+            self._resize_channel_major(wave.unsqueeze(0), target_len).squeeze(0)
+            if wave.size(-1) != target_len
+            else wave
+            for wave in waves
+        ]
+        mixed = torch.zeros_like(resized[0])
+        for weight, wave in zip(weights, resized):
+            mixed = mixed + wave * float(weight)
+        return mixed, 22050
+
+    def _field_level_enabled(self, recipe: Optional[FusionRecipe], branch_name: str, level: str) -> bool:
+        if recipe is None:
+            return False
+        branch_levels = recipe.branch(branch_name).levels
+        if branch_levels:
+            return level in branch_levels
+        return recipe.is_enabled(level)
+
+    def _resolve_branch_bundle(
+        self,
+        recipe: Optional[FusionRecipe],
+        branch_name: str,
+        field_name: str,
+        level_name: str,
+        default_path: str,
+        verbose: bool = False,
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        if recipe is None:
+            bundle = self._get_reference_conditioning(default_path, verbose=verbose)
+            return bundle[field_name], {
+                "references": [default_path],
+                "weights": [1.0],
+                "anchor_mode": "first",
+                "operator": "identity",
+                "field": field_name,
+            }
+
+        references = branch_references(recipe, branch_name)
+        if not references:
+            bundle = self._get_reference_conditioning(default_path, verbose=verbose)
+            return bundle[field_name], {
+                "references": [default_path],
+                "weights": [1.0],
+                "anchor_mode": "first",
+                "operator": "identity",
+                "field": field_name,
+            }
+
+        anchor_mode = branch_anchor_mode(recipe, branch_name)
+        operator = branch_operator(recipe, branch_name)
+        if len(references) == 1:
+            cache_key = recipe_cache_token(recipe, branch_name, {"path": references[0].path})
+            bundle = self._get_reference_conditioning(references[0].path, verbose=verbose, cache_key=cache_key)
+            return bundle[field_name], {
+                "references": [references[0].path],
+                "weights": [1.0],
+                "anchor_mode": anchor_mode,
+                "operator": "identity",
+                "field": field_name,
+            }
+
+        use_waveform_mix = self._field_level_enabled(recipe, branch_name, "waveform")
+        if use_waveform_mix:
+            mixed_audio, mixed_sr = self._mix_reference_waveforms(references, anchor_mode, verbose=verbose)
+            cache_key = recipe_cache_token(recipe, branch_name, {"mixed": True, "field": field_name})
+            bundle = self._build_reference_conditioning_from_audio(
+                mixed_audio,
+                mixed_sr,
+                cache_key=cache_key,
+                verbose=verbose,
+                source_path="waveform_mix",
+            )
+            return bundle[field_name], {
+                "references": [reference.path for reference in references],
+                "weights": normalize_weights(tuple(references)),
+                "anchor_mode": anchor_mode,
+                "operator": "waveform_mix",
+                "field": field_name,
+            }
+
+        if not self._field_level_enabled(recipe, branch_name, level_name):
+            anchor_idx = self._select_anchor_index(
+                len(references),
+                anchor_mode,
+                normalize_weights(tuple(references)),
+            )
+            bundle = self._get_reference_conditioning(references[anchor_idx].path, verbose=verbose)
+            return bundle[field_name], {
+                "references": [references[anchor_idx].path],
+                "weights": [1.0],
+                "anchor_mode": anchor_mode,
+                "operator": "anchor_only",
+                "field": field_name,
+            }
+
+        weights = normalize_weights(tuple(references))
+        bundles = [
+            self._get_reference_conditioning(
+                reference.path,
+                verbose=verbose,
+                cache_key=recipe_cache_token(recipe, branch_name, {"path": reference.path, "field": field_name}),
+            )
+            for reference in references
+        ]
+        tensors = [bundle[field_name] for bundle in bundles]
+        layout = None
+        if field_name in {"spk_cond_emb", "speech_conditioning_latent", "prompt_condition"}:
+            layout = "time_major"
+        elif field_name == "ref_mel":
+            layout = "channel_major"
+        merged = self._weighted_merge(tensors, weights, layout, anchor_mode)
+        return merged, {
+            "references": [reference.path for reference in references],
+            "weights": weights,
+            "anchor_mode": anchor_mode,
+            "operator": operator,
+            "field": field_name,
+        }
+
+    def _resolve_supported_conditioning(
+        self,
+        spk_audio_prompt: str,
+        fusion_recipe: Optional[FusionRecipe],
+        verbose: bool = False,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
+        bundle = self._get_reference_conditioning(spk_audio_prompt, verbose=verbose)
+        metadata = {"recipe": recipe_metadata(fusion_recipe), "branches": {}}
+        if fusion_recipe is None:
+            return bundle, metadata
+
+        resolved = dict(bundle)
+        branch_fields = {
+            "speaker": ("spk_cond_emb", "spk_cond_emb"),
+            "speaker_latent": ("speech_conditioning_latent", "speech_conditioning_latent"),
+            "prompt": ("prompt_condition", "prompt_condition"),
+            "style": ("style", "style"),
+            "ref_mel": ("ref_mel", "ref_mel"),
+        }
+        branch_to_config = {
+            "speaker": "speaker",
+            "speaker_latent": "speaker",
+            "prompt": "prompt",
+            "style": "style",
+            "ref_mel": "ref_mel",
+        }
+        for metadata_key, (field_name, level_name) in branch_fields.items():
+            tensor, branch_meta = self._resolve_branch_bundle(
+                fusion_recipe,
+                branch_to_config[metadata_key],
+                field_name,
+                level_name,
+                spk_audio_prompt,
+                verbose=verbose,
+            )
+            resolved[field_name] = tensor
+            metadata["branches"][metadata_key] = branch_meta
+        resolved["cond_length"] = torch.tensor(
+            [resolved["spk_cond_emb"].shape[-2]],
+            device=resolved["spk_cond_emb"].device,
+        )
+        return resolved, metadata
+
+    def _apply_experimental_cat_condition(
+        self,
+        cat_condition: torch.Tensor,
+        cond: torch.Tensor,
+        spk_audio_prompt: str,
+        fusion_recipe: Optional[FusionRecipe],
+        verbose: bool = False,
+    ) -> torch.Tensor:
+        if fusion_recipe is None or "cat_condition" not in fusion_recipe.experimental_levels:
+            return cat_condition
+        references = branch_references(fusion_recipe, "prompt")
+        if len(references) < 2:
+            return cat_condition
+        weights = normalize_weights(tuple(references))
+        cat_conditions = []
+        for reference in references:
+            bundle = self._get_reference_conditioning(
+                reference.path,
+                verbose=verbose,
+                cache_key=recipe_cache_token(
+                    fusion_recipe,
+                    "prompt",
+                    {"path": reference.path, "field": "cat_condition"},
+                ),
+            )
+            cat_conditions.append(torch.cat([bundle["prompt_condition"], cond], dim=1))
+        return self._weighted_merge(
+            cat_conditions,
+            weights,
+            "time_major",
+            branch_anchor_mode(fusion_recipe, "prompt"),
+        )
+
+    def _apply_experimental_vc_target(
+        self,
+        vc_target: torch.Tensor,
+        cat_condition: torch.Tensor,
+        fusion_recipe: Optional[FusionRecipe],
+        verbose: bool,
+        diffusion_steps: int,
+        inference_cfg_rate: float,
+    ) -> torch.Tensor:
+        if fusion_recipe is None or "vc_target" not in fusion_recipe.experimental_levels:
+            return vc_target
+        references = branch_references(fusion_recipe, "ref_mel")
+        if len(references) < 2:
+            return vc_target
+        weights = normalize_weights(tuple(references))
+        vc_targets = []
+        for reference in references:
+            bundle = self._get_reference_conditioning(
+                reference.path,
+                verbose=verbose,
+                cache_key=recipe_cache_token(
+                    fusion_recipe,
+                    "ref_mel",
+                    {"path": reference.path, "field": "vc_target"},
+                ),
+            )
+            target = self.s2mel.models["cfm"].inference(
+                cat_condition,
+                torch.LongTensor([cat_condition.size(1)]).to(cat_condition.device),
+                bundle["ref_mel"],
+                bundle["style"],
+                None,
+                diffusion_steps,
+                inference_cfg_rate=inference_cfg_rate,
+            )
+            vc_targets.append(target[:, :, bundle["ref_mel"].size(-1):])
+        return self._weighted_merge(
+            vc_targets,
+            weights,
+            "channel_major",
+            branch_anchor_mode(fusion_recipe, "ref_mel"),
+        )
 
     def remove_long_silence(self, codes: torch.Tensor, silent_token=52, max_consecutive=30):
         """
@@ -353,19 +891,31 @@ class IndexTTS2:
 
         return emo_vector
 
+    def _write_metadata_file(self, metadata_output_path: Optional[str], metadata: Dict[str, Any]) -> None:
+        if not metadata_output_path:
+            return
+        output_dir = os.path.dirname(metadata_output_path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        with open(metadata_output_path, "w", encoding="utf-8") as file_obj:
+            json.dump(metadata, file_obj, ensure_ascii=False, indent=2)
+
     # 原始推理模式
     def infer(self, spk_audio_prompt, text, output_path,
               emo_audio_prompt=None, emo_alpha=1.0,
               emo_vector=None,
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
-              verbose=False, max_text_tokens_per_segment=120, stream_return=False, more_segment_before=0, **generation_kwargs):
+              verbose=False, max_text_tokens_per_segment=120, stream_return=False, more_segment_before=0,
+              fusion_recipe=None, return_metadata=False, metadata_output_path=None, **generation_kwargs):
         if stream_return:
             return self.infer_generator(
                 spk_audio_prompt, text, output_path,
                 emo_audio_prompt, emo_alpha,
                 emo_vector,
                 use_emo_text, emo_text, use_random, interval_silence,
-                verbose, max_text_tokens_per_segment, stream_return, more_segment_before, **generation_kwargs
+                verbose, max_text_tokens_per_segment, stream_return, more_segment_before,
+                fusion_recipe=fusion_recipe, return_metadata=return_metadata,
+                metadata_output_path=metadata_output_path, **generation_kwargs
             )
         else:
             try:
@@ -374,7 +924,9 @@ class IndexTTS2:
                     emo_audio_prompt, emo_alpha,
                     emo_vector,
                     use_emo_text, emo_text, use_random, interval_silence,
-                    verbose, max_text_tokens_per_segment, stream_return, more_segment_before, **generation_kwargs
+                    verbose, max_text_tokens_per_segment, stream_return, more_segment_before,
+                    fusion_recipe=fusion_recipe, return_metadata=return_metadata,
+                    metadata_output_path=metadata_output_path, **generation_kwargs
                 ))[0]
             except IndexError:
                 return None
@@ -383,7 +935,8 @@ class IndexTTS2:
               emo_audio_prompt=None, emo_alpha=1.0,
               emo_vector=None,
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
-              verbose=False, max_text_tokens_per_segment=120, stream_return=False, quick_streaming_tokens=0, **generation_kwargs):
+              verbose=False, max_text_tokens_per_segment=120, stream_return=False, quick_streaming_tokens=0,
+              fusion_recipe=None, return_metadata=False, metadata_output_path=None, **generation_kwargs):
         print(">> starting inference...")
         self._set_gr_progress(0, "starting inference...")
         if verbose:
@@ -392,6 +945,13 @@ class IndexTTS2:
                   f"emo_vector:{emo_vector}, use_emo_text:{use_emo_text}, "
                   f"emo_text:{emo_text}")
         start_time = time.perf_counter()
+        if fusion_recipe is None and isinstance(spk_audio_prompt, (list, tuple)):
+            fusion_recipe = {
+                "references": list(spk_audio_prompt),
+                "enabled_levels": list(SUPPORTED_FUSION_LEVELS),
+            }
+            spk_audio_prompt = spk_audio_prompt[0]
+        fusion_recipe = coerce_fusion_recipe(fusion_recipe)
 
         if use_emo_text or emo_vector is not None:
             # we're using a text or emotion vector guidance; so we must remove
@@ -402,7 +962,7 @@ class IndexTTS2:
             # automatically generate emotion vectors from text prompt
             if emo_text is None:
                 emo_text = text  # use main text prompt
-            emo_dict = self.qwen_emo.inference(emo_text)
+            emo_dict = self._get_qwen_emo().inference(emo_text)
             print(f"detected emotion vectors from text: {emo_dict}")
             # convert ordered dict to list of vectors; the order is VERY important!
             emo_vector = list(emo_dict.values())
@@ -469,6 +1029,26 @@ class IndexTTS2:
             spk_cond_emb = self.cache_spk_cond
             ref_mel = self.cache_mel
 
+        fusion_metadata = {"recipe": recipe_metadata(fusion_recipe), "branches": {}}
+        speech_conditioning_latent = None
+        if fusion_recipe is not None:
+            conditioning_bundle, fusion_metadata = self._resolve_supported_conditioning(
+                spk_audio_prompt,
+                fusion_recipe,
+                verbose=verbose,
+            )
+            spk_cond_emb = conditioning_bundle["spk_cond_emb"]
+            speech_conditioning_latent = conditioning_bundle["speech_conditioning_latent"]
+            prompt_condition = conditioning_bundle["prompt_condition"]
+            style = conditioning_bundle["style"]
+            ref_mel = conditioning_bundle["ref_mel"]
+
+            self.cache_spk_cond = spk_cond_emb
+            self.cache_s2mel_style = style
+            self.cache_s2mel_prompt = prompt_condition
+            self.cache_spk_audio_prompt = spk_audio_prompt
+            self.cache_mel = ref_mel
+
         if emo_vector is not None:
             weight_vector = torch.tensor(emo_vector, device=self.device)
             if use_random:
@@ -482,18 +1062,27 @@ class IndexTTS2:
             emovec_mat = torch.sum(emovec_mat, 0)
             emovec_mat = emovec_mat.unsqueeze(0)
 
-        if self.cache_emo_cond is None or self.cache_emo_audio_prompt != emo_audio_prompt:
+        emotion_metadata = {
+            "references": [emo_audio_prompt],
+            "weights": [1.0],
+            "anchor_mode": "first",
+            "operator": "identity",
+            "field": "emo_cond_emb",
+        }
+        if fusion_recipe is not None:
+            emo_cond_emb, emotion_metadata = self._resolve_emotion_conditioning(
+                emo_audio_prompt,
+                fusion_recipe,
+                verbose=verbose,
+            )
+            self.cache_emo_cond = emo_cond_emb
+            self.cache_emo_audio_prompt = emo_audio_prompt
+            fusion_metadata["branches"]["emotion"] = emotion_metadata
+        elif self.cache_emo_cond is None or self.cache_emo_audio_prompt != emo_audio_prompt:
             if self.cache_emo_cond is not None:
                 self.cache_emo_cond = None
                 torch.cuda.empty_cache()
-            emo_audio, _ = self._load_and_cut_audio(emo_audio_prompt,15,verbose,sr=16000)
-            emo_inputs = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
-            emo_input_features = emo_inputs["input_features"]
-            emo_attention_mask = emo_inputs["attention_mask"]
-            emo_input_features = emo_input_features.to(self.device)
-            emo_attention_mask = emo_attention_mask.to(self.device)
-            emo_cond_emb = self.get_emb(emo_input_features, emo_attention_mask)
-
+            emo_cond_emb = self._get_emotion_conditioning(emo_audio_prompt, verbose=verbose)
             self.cache_emo_cond = emo_cond_emb
             self.cache_emo_audio_prompt = emo_audio_prompt
         else:
@@ -525,6 +1114,12 @@ class IndexTTS2:
         repetition_penalty = generation_kwargs.pop("repetition_penalty", 10.0)
         max_mel_tokens = generation_kwargs.pop("max_mel_tokens", 1500)
         sampling_rate = 22050
+        diffusion_steps = fusion_recipe.diffusion_steps if fusion_recipe is not None else generation_kwargs.pop("diffusion_steps", 25)
+        inference_cfg_rate = (
+            fusion_recipe.inference_cfg_rate
+            if fusion_recipe is not None
+            else generation_kwargs.pop("inference_cfg_rate", 0.7)
+        )
 
         wavs = []
         gpt_gen_time = 0
@@ -533,6 +1128,18 @@ class IndexTTS2:
         bigvgan_time = 0
         has_warned = False
         silence = None # for stream_return
+        run_metadata = {
+            "text": text,
+            "speaker_prompt": spk_audio_prompt,
+            "emotion_prompt": emo_audio_prompt,
+            "emotion_alpha": emo_alpha,
+            "emotion_vector": emo_vector,
+            "fusion": fusion_metadata,
+            "experimental_levels": list(fusion_recipe.experimental_levels) if fusion_recipe is not None else [],
+            "segments": [],
+            "diffusion_steps": diffusion_steps,
+            "inference_cfg_rate": inference_cfg_rate,
+        }
         for seg_idx, sent in enumerate(segments):
             self._set_gr_progress(0.2 + 0.7 * seg_idx / segments_count,
                                   f"speech synthesis {seg_idx + 1}/{segments_count}...")
@@ -577,6 +1184,7 @@ class IndexTTS2:
                         num_beams=num_beams,
                         repetition_penalty=repetition_penalty,
                         max_generate_length=max_mel_tokens,
+                        speech_conditioning_latent_override=speech_conditioning_latent,
                         **generation_kwargs
                     )
 
@@ -634,8 +1242,6 @@ class IndexTTS2:
                 dtype = None
                 with torch.amp.autocast(text_tokens.device.type, enabled=dtype is not None, dtype=dtype):
                     m_start_time = time.perf_counter()
-                    diffusion_steps = 25
-                    inference_cfg_rate = 0.7
                     latent = self.s2mel.models['gpt_layer'](latent)
                     S_infer = self.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1))
                     S_infer = S_infer.transpose(1, 2)
@@ -647,12 +1253,27 @@ class IndexTTS2:
                                                                  n_quantizers=3,
                                                                  f0=None)[0]
                     cat_condition = torch.cat([prompt_condition, cond], dim=1)
+                    cat_condition = self._apply_experimental_cat_condition(
+                        cat_condition,
+                        cond,
+                        spk_audio_prompt,
+                        fusion_recipe,
+                        verbose=verbose,
+                    )
                     vc_target = self.s2mel.models['cfm'].inference(cat_condition,
                                                                    torch.LongTensor([cat_condition.size(1)]).to(
                                                                        cond.device),
                                                                    ref_mel, style, None, diffusion_steps,
-                                                                   inference_cfg_rate=inference_cfg_rate)
+                                                                    inference_cfg_rate=inference_cfg_rate)
                     vc_target = vc_target[:, :, ref_mel.size(-1):]
+                    vc_target = self._apply_experimental_vc_target(
+                        vc_target,
+                        cat_condition,
+                        fusion_recipe,
+                        verbose,
+                        diffusion_steps,
+                        inference_cfg_rate,
+                    )
                     s2mel_time += time.perf_counter() - m_start_time
 
                     m_start_time = time.perf_counter()
@@ -666,6 +1287,15 @@ class IndexTTS2:
                     print(f"wav shape: {wav.shape}", "min:", wav.min(), "max:", wav.max())
                 # wavs.append(wav[:, :-512])
                 wavs.append(wav.cpu())  # to cpu before saving
+                run_metadata["segments"].append(
+                    {
+                        "index": seg_idx,
+                        "text": self.tokenizer.decode(text_tokens[0].tolist()),
+                        "code_length": int(code_lens[0].item()),
+                        "wav_samples": int(wav.shape[-1]),
+                        "cat_condition_length": int(cat_condition.size(1)),
+                    }
+                )
                 if stream_return:
                     yield wav.cpu()
                     if silence == None:
@@ -684,6 +1314,15 @@ class IndexTTS2:
         print(f">> Total inference time: {end_time - start_time:.2f} seconds")
         print(f">> Generated audio length: {wav_length:.2f} seconds")
         print(f">> RTF: {(end_time - start_time) / wav_length:.4f}")
+        run_metadata["timings"] = {
+            "gpt_gen_time": gpt_gen_time,
+            "gpt_forward_time": gpt_forward_time,
+            "s2mel_time": s2mel_time,
+            "bigvgan_time": bigvgan_time,
+            "total_time": end_time - start_time,
+            "wav_length_seconds": wav_length,
+            "rtf": (end_time - start_time) / wav_length if wav_length > 0 else None,
+        }
 
         # save audio
         wav = wav.cpu()  # to cpu
@@ -696,16 +1335,27 @@ class IndexTTS2:
                 os.makedirs(os.path.dirname(output_path), exist_ok=True)
             torchaudio.save(output_path, wav.type(torch.int16), sampling_rate)
             print(">> wav file saved to:", output_path)
+            run_metadata["output_path"] = output_path
+            self.last_inference_metadata = run_metadata
+            self._write_metadata_file(metadata_output_path, run_metadata)
             if stream_return:
                 return None
-            yield output_path
+            if return_metadata:
+                yield {"output_path": output_path, "metadata": run_metadata}
+            else:
+                yield output_path
         else:
             if stream_return:
                 return None
             # 返回以符合Gradio的格式要求
+            self.last_inference_metadata = run_metadata
+            self._write_metadata_file(metadata_output_path, run_metadata)
             wav_data = wav.type(torch.int16)
             wav_data = wav_data.numpy().T
-            yield (sampling_rate, wav_data)
+            if return_metadata:
+                yield {"audio": (sampling_rate, wav_data), "metadata": run_metadata}
+            else:
+                yield (sampling_rate, wav_data)
 
 
 def find_most_similar_cosine(query_vector, matrix):
@@ -718,6 +1368,8 @@ def find_most_similar_cosine(query_vector, matrix):
 
 class QwenEmotion:
     def __init__(self, model_dir):
+        from modelscope import AutoModelForCausalLM
+
         self.model_dir = model_dir
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_dir)
         self.model = AutoModelForCausalLM.from_pretrained(

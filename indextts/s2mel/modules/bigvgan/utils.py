@@ -3,17 +3,24 @@
 
 import glob
 import os
-import matplotlib
 import torch
 from torch.nn.utils import weight_norm
 
-matplotlib.use("Agg")
-import matplotlib.pylab as plt
 from .meldataset import MAX_WAV_VALUE
 from scipy.io.wavfile import write
 
 
+def _load_matplotlib():
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pylab as plt
+
+    return plt
+
+
 def plot_spectrogram(spectrogram):
+    plt = _load_matplotlib()
     fig, ax = plt.subplots(figsize=(10, 2))
     im = ax.imshow(spectrogram, aspect="auto", origin="lower", interpolation="none")
     plt.colorbar(im, ax=ax)
@@ -25,6 +32,7 @@ def plot_spectrogram(spectrogram):
 
 
 def plot_spectrogram_clipped(spectrogram, clip_max=2.0):
+    plt = _load_matplotlib()
     fig, ax = plt.subplots(figsize=(10, 2))
     im = ax.imshow(
         spectrogram,
