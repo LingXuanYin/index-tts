@@ -29,3 +29,9 @@
 - [x] 5.1 Add focused tests for backward-compatible single-speaker inference, supported-tier fusion execution, cache-key isolation, and experiment manifest reproducibility.
 - [ ] 5.2 Run the first ten-batch open-source full-combination experiment to verify output generation, score collection, and report ranking.
 - [ ] 5.3 Document the supported and experimental fusion levels, the ten-batch open-source experiment workflow, and the selected default recommendation for future apply work.
+
+## Current Handoff Status
+
+- Handoff document: `docs/SPEAKER_FUSION_HANDOFF_20260319.md`
+- 5.2 is still pending because the committed branch excludes local `data/` and `artifacts/`, so the ten-batch run results are not part of the pushed branch.
+- 5.3 is still pending because the supported and experimental implementation is documented, but the default recommended fusion scheme has not been selected yet.
