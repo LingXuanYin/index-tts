@@ -755,7 +755,8 @@ class IndexTTS2:
                 diffusion_steps,
                 inference_cfg_rate=inference_cfg_rate,
             )
-            vc_targets.append(target[:, :, bundle["ref_mel"].size(-1):])
+            prompt_frames = min(bundle["ref_mel"].size(-1), target.size(-1))
+            vc_targets.append(target[:, :, prompt_frames:])
         return self._weighted_merge(
             vc_targets,
             weights,
@@ -1265,7 +1266,8 @@ class IndexTTS2:
                                                                        cond.device),
                                                                    ref_mel, style, None, diffusion_steps,
                                                                     inference_cfg_rate=inference_cfg_rate)
-                    vc_target = vc_target[:, :, ref_mel.size(-1):]
+                    prompt_frames = min(ref_mel.size(-1), vc_target.size(-1))
+                    vc_target = vc_target[:, :, prompt_frames:]
                     vc_target = self._apply_experimental_vc_target(
                         vc_target,
                         cat_condition,

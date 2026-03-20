@@ -76,7 +76,10 @@ class BASECFM(torch.nn.Module, ABC):
         # Or in future might add like a return_all_steps flag
         sol = []
         # apply prompt
-        prompt_len = prompt.size(-1)
+        # Fused or borrowed reference mels can be longer than the target path
+        # we are diffusing for. Clamp the copied prompt region so inference
+        # stays valid instead of indexing past the current target length.
+        prompt_len = min(prompt.size(-1), x.size(-1), mu.size(1))
         prompt_x = torch.zeros_like(x)
         prompt_x[..., :prompt_len] = prompt[..., :prompt_len]
         x[..., :prompt_len] = 0
