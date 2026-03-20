@@ -225,3 +225,53 @@ OpenSpec 中以下任务仍未完成:
 - 先确认示例音频删除是否应保留
 - 先补一轮真实推理回归
 - 先补 ten-batch 结果和默认方案结论
+
+## 9. 2026-03-20 恢复记录
+
+- 工作模式: `parallel`
+- 当前目标: 跑完 `IndexTTS v2` 非训练音色融合实验，分别选出 `音色多源参考` 和 `情绪多源参考` 的推荐融合方案，并保持变量分离
+- 当前假设:
+  - 正式评分基于 `LibriSpeech-only` 十批次裁剪切片
+  - timbre 正式清单使用 `6s` 参考裁剪版以控制 V100 显存波动
+  - emotion 正式清单固定 timbre 为 A，只改变 `branch_configs.emotion`
+  - 实验必须使用本机 GPU，不使用 CPU 生成音频
+- 当前阻塞:
+  - timbre 稳定跑尚未完成，恢复时 `artifacts/speaker_fusion_timbre_screen_trim6/run_results_stable.jsonl` 已有 `72/90`
+  - `ref_mel` 路线已出现至少一个短文本不稳定样本，后续排名必须计入可靠性惩罚，不能直接推荐
+- 下一步:
+  - 等待或接续完成 timbre 稳定跑
+  - 运行 timbre 稳定评分并选出默认/回退方案
+  - 运行 emotion 正式实验与评分
+  - 更新 OpenSpec `5.2`、`5.3` 和文档结论
+
+### 9.1 2026-03-20 晚间阻塞快照
+
+- `timbre` 稳定跑在 `77/90` 处中断:
+  - 结果文件: `artifacts/speaker_fusion_timbre_screen_trim6/run_results_stable.jsonl`
+  - 中断后 Python 进程变为僵尸，未继续写出新结果
+- 当前 GPU 状态:
+  - `nvidia-smi` 返回 `Unable to determine the device handle ... Unknown Error` / `No devices were found`
+  - `.venv` 中 `torch.cuda.is_available()` 返回 `False`
+  - `journalctl -k` 记录 `2026-03-20 20:45:58` 的 `NVRM: Xid 79` 与 `GPU has fallen off the bus`
+  - 内核同时提示 `GPU Reset Required`
+- 当前权限状态:
+  - 当前用户 `nemo` 无 root 权限
+  - `sudo -n true` 失败，不能在当前会话内完成驱动或 GPU reset
+- 本轮在阻塞窗口内补做的代码修正:
+  - `tools/score_timbre_stable.py`
+    - 改为按“逻辑方案”聚合十批次结果，而不是按每条 case 独立排名
+    - 保留全失败/未完成方案在报告中的可靠性惩罚，不再让缺失方案直接消失
+  - `tools/score_emotion_stable.py`
+    - 修正 `emotion_tensor_anchor_a` 的 sanity 判据，避免把 A 锚定方案错误罚成“必须 A/B 均衡”
+    - 默认推荐只从 supported multiref 方案中选，experimental waveform 单独列为 `top_experimental`
+    - 保留零输出方案在报告中的失败可见性
+- 卡恢复后的直接续跑命令:
+
+```bash
+source .venv/bin/activate
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python tools/stable_speaker_fusion_run.py \
+  --manifest artifacts/speaker_fusion_timbre_screen_trim6/manifest.jsonl \
+  --results-path artifacts/speaker_fusion_timbre_screen_trim6/run_results_stable.jsonl \
+  --reload-every 8 \
+  --continue-on-error
+```
