@@ -1,5 +1,6 @@
 import argparse
 import csv
+import gc
 import json
 import os
 import sys
@@ -48,6 +49,35 @@ def recommendation_candidates(report_rows: List[Dict[str, Any]], *, experimental
     ]
 
 
+def lightweight_style_embedding(tts: IndexTTS2, audio_path: str) -> Any:
+    _, torchaudio = sfe._require_torch_modules()
+    audio_16k, _ = tts._load_and_cut_audio(audio_path, 15, False, sr=16000)
+    feat = torchaudio.compliance.kaldi.fbank(
+        audio_16k.to(tts.device),
+        num_mel_bins=80,
+        dither=0,
+        sample_frequency=16000,
+    )
+    feat = feat - feat.mean(dim=0, keepdim=True)
+    return tts.campplus_model(feat.unsqueeze(0)).squeeze(0).detach().cpu()
+
+
+def configure_tts_for_scoring(tts: IndexTTS2) -> None:
+    if hasattr(tts, "semantic_codec"):
+        tts.semantic_codec = tts.semantic_codec.to("cpu")
+    if hasattr(tts, "bigvgan"):
+        tts.bigvgan = tts.bigvgan.to("cpu")
+    if hasattr(tts, "emo_matrix"):
+        tts.emo_matrix = tuple(chunk.to("cpu") for chunk in tts.emo_matrix)
+    if hasattr(tts, "spk_matrix"):
+        tts.spk_matrix = tuple(chunk.to("cpu") for chunk in tts.spk_matrix)
+    if hasattr(tts, "s2mel"):
+        tts.s2mel = tts.s2mel.to("cpu")
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def emotion_vector(
     tts: IndexTTS2,
     speaker_bundle: Dict[str, torch.Tensor],
@@ -81,11 +111,15 @@ def score_case(
 
     def speaker_bundle(path: str) -> Dict[str, torch.Tensor]:
         if path not in speaker_bundle_cache:
-            speaker_bundle_cache[path] = tts._get_reference_conditioning(
-                path,
-                verbose=False,
-                cache_key=f"emotion-score::speaker::{path}",
-            )
+            audio_16k, _ = tts._load_and_cut_audio(path, 15, False, sr=16000)
+            inputs = tts.extract_features(audio_16k, sampling_rate=16000, return_tensors="pt")
+            input_features = inputs["input_features"].to(tts.device)
+            attention_mask = inputs["attention_mask"].to(tts.device)
+            spk_cond_emb = tts.get_emb(input_features, attention_mask)
+            speaker_bundle_cache[path] = {
+                "spk_cond_emb": spk_cond_emb,
+                "cond_length": torch.tensor([spk_cond_emb.shape[-1]], device=spk_cond_emb.device),
+            }
         return speaker_bundle_cache[path]
 
     def style(path: str) -> Any:
@@ -214,7 +248,14 @@ def main() -> None:
     parser.add_argument("--results-path")
     parser.add_argument("--cfg-path", default="checkpoints/config.yaml")
     parser.add_argument("--model-dir", default="checkpoints")
+    parser.add_argument("--use-fp16", action="store_true")
+    parser.add_argument("--no-fp16", action="store_true")
     args = parser.parse_args()
+    use_fp16 = False
+    if args.use_fp16:
+        use_fp16 = True
+    if args.no_fp16:
+        use_fp16 = False
 
     manifest_path = Path(args.manifest)
     results_path = Path(args.results_path) if args.results_path else manifest_path.with_name("run_results_stable.jsonl")
@@ -224,10 +265,12 @@ def main() -> None:
     tts = IndexTTS2(
         cfg_path=args.cfg_path,
         model_dir=args.model_dir,
-        use_fp16=False,
+        use_fp16=use_fp16,
         use_cuda_kernel=False,
         use_deepspeed=False,
     )
+    configure_tts_for_scoring(tts)
+    sfe.style_embedding = lightweight_style_embedding
     attempts_by_scheme: Counter[str] = Counter(row["scheme_id"] for row in manifest_rows)
     status_counts_by_scheme: Dict[str, Counter[str]] = defaultdict(Counter)
     speaker_bundle_cache: Dict[str, Dict[str, torch.Tensor]] = {}

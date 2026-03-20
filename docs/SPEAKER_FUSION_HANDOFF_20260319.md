@@ -275,3 +275,65 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python tools/stable_speaker_fus
   --reload-every 8 \
   --continue-on-error
 ```
+
+### 9.2 2026-03-20 后续进展
+
+- `timbre` 正式实验已补跑完成:
+  - 结果文件: `artifacts/speaker_fusion_timbre_screen_trim6/run_results_stable.jsonl`
+  - 总数: `90/90`
+  - 稳定评分输出:
+    - `artifacts/speaker_fusion_timbre_screen_trim6/scores_stable.jsonl`
+    - `artifacts/speaker_fusion_timbre_screen_trim6/ranked_report_stable.csv`
+    - `artifacts/speaker_fusion_timbre_screen_trim6/ranked_summary_stable.json`
+- `timbre` 当前推荐结论:
+  - 默认推荐: `spk_cond_emb + speech_conditioning_latent`
+  - 回退推荐: `speech_conditioning_latent`
+  - 不推荐进入默认集: `ref_mel` 与 `style + ref_mel`
+    - 原因: 十批次中各有 `1/10` 失败，`pass_rate = 0.9`
+- `timbre` 稳定集主要排序摘录:
+  - `spk_cond_emb + speech_conditioning_latent`
+    - `pass_rate = 1.0`
+    - `overall_score = 0.6866552025666145`
+  - `speech_conditioning_latent`
+    - `pass_rate = 1.0`
+    - `overall_score = 0.6864684136020992`
+  - `style`
+    - `pass_rate = 1.0`
+    - `overall_score = 0.681640545579843`
+  - `spk_cond_emb`
+    - `pass_rate = 1.0`
+    - `overall_score = 0.6812977840525117`
+- 评分脚本本轮已改为低显存模式:
+  - `tools/score_timbre_stable.py`
+  - `tools/score_emotion_stable.py`
+  - 目的:
+    - 不再把完整生成图都常驻在 GPU 上
+    - 纠正 timbre 的“按 case 而不是按逻辑方案聚合”问题
+    - 纠正 emotion 的 anchor-A 判据和 experimental 推荐污染问题
+- `emotion` 正式实验部分完成:
+  - 结果文件: `artifacts/speaker_fusion_emotion_screen_trim6/run_results_stable.jsonl`
+  - 当前进度: `17/50`
+  - 已观察到:
+    - 前 `17` 条均已落盘
+    - 至少前 `16` 条为 `done`
+    - 第 `17` 条 `librispeech-03-emotion-016` 在 GPU 崩溃时被记录为 `error`
+- 第二次 GPU 硬阻塞:
+  - 时间: `2026-03-20 21:24:35`
+  - `journalctl -k` 记录:
+    - `Xid 79`
+    - `GPU has fallen off the bus`
+    - `GPU Reset Required`
+  - 当前直接后果:
+    - `nvidia-smi` 无设备
+    - `.venv` 中 `torch.cuda.is_available() == False`
+    - 当前会话无法继续完成 emotion 余下 `33` 条
+- GPU 恢复后的 emotion 续跑命令:
+
+```bash
+source .venv/bin/activate
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python tools/stable_speaker_fusion_run.py \
+  --manifest artifacts/speaker_fusion_emotion_screen_trim6/manifest.jsonl \
+  --results-path artifacts/speaker_fusion_emotion_screen_trim6/run_results_stable.jsonl \
+  --reload-every 4 \
+  --continue-on-error
+```
