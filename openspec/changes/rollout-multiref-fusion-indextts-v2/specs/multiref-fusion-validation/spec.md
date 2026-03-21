@@ -1,26 +1,22 @@
 ## ADDED Requirements
 
-### Requirement: Rollout validation SHALL cover preset construction and backward compatibility
-The system SHALL include automated validation for supported timbre and emotion preset construction and for unchanged legacy single-reference behavior.
+### Requirement: Rollout preset construction SHALL be covered by automated tests
+The system SHALL include automated tests for the supported multi-reference timbre and emotion rollout presets.
 
 #### Scenario: Validate supported preset construction
-- **WHEN** automated tests execute against the rollout helper layer
-- **THEN** they verify the effective recipe for supported timbre and emotion defaults and fallbacks
+- **WHEN** the automated unit suite runs
+- **THEN** it verifies the selected supported defaults and fallbacks for timbre and emotion, including levels, anchors, and compatibility behavior
 
-#### Scenario: Validate backward compatibility
-- **WHEN** automated tests execute against the runtime API without any rollout-facing multi-reference inputs
-- **THEN** they verify that legacy single-reference inference behavior remains available
+### Requirement: Backward compatibility SHALL be covered by automated tests
+The system SHALL include automated tests proving that the legacy single-reference `IndexTTS2` path still works when rollout-facing multi-reference inputs are absent.
 
-### Requirement: Rollout validation SHALL cover interface-level multi-reference invocation
-The system SHALL include automated coverage for at least one user-facing invocation surface that exercises multi-reference timbre and emotion arguments through the supported rollout path.
+#### Scenario: Validate legacy call compatibility
+- **WHEN** the automated unit suite runs against the rollout runtime surface
+- **THEN** it verifies that legacy single-reference calls remain valid and do not require rollout-specific arguments
 
-#### Scenario: Validate interface invocation
-- **WHEN** automated tests execute against a supported invocation surface
-- **THEN** they verify that multi-reference timbre and emotion arguments reach the runtime with the expected preset-driven behavior
+### Requirement: Supported multi-reference execution SHALL have an end-to-end smoke path
+The system SHALL provide an end-to-end smoke validation path for supported multi-reference synthesis in the project virtual environment.
 
-### Requirement: Rollout validation SHALL include one end-to-end smoke path
-The system SHALL run at least one end-to-end validation path in the project virtual environment before the rollout is considered complete.
-
-#### Scenario: Run end-to-end smoke validation
-- **WHEN** the rollout validation step executes in `.venv`
-- **THEN** it runs one end-to-end synthesis smoke path and records whether the supported multi-reference flow executes successfully
+#### Scenario: Run the multi-reference smoke path
+- **WHEN** the rollout validation workflow executes the smoke path from `.venv`
+- **THEN** it proves that supported multi-reference timbre and emotion synthesis can run end to end and emit output metadata
