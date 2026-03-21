@@ -290,6 +290,12 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python tools/stable_speaker_fus
   - 回退推荐: `speech_conditioning_latent`
   - 不推荐进入默认集: `ref_mel` 与 `style + ref_mel`
     - 原因: 十批次中各有 `1/10` 失败，`pass_rate = 0.9`
+  - 后续 CPU 单独复核:
+    - `librispeech-05-timbre-006` (`ref_mel`)
+    - `librispeech-05-timbre-008` (`style + ref_mel`)
+    - 在 `--device cpu` 下再次稳定复现同一错误:
+      - `Calculated padded input size per channel: (6). Kernel size: (7). Kernel size can't be greater than actual input size`
+    - 因此 `ref_mel` 相关失败已确认为方案级不稳定，而不是 GPU / 恢复噪声
 - `timbre` 稳定集主要排序摘录:
   - `spk_cond_emb + speech_conditioning_latent`
     - `pass_rate = 1.0`
@@ -310,6 +316,7 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python tools/stable_speaker_fus
     - 不再把完整生成图都常驻在 GPU 上
     - 纠正 timbre 的“按 case 而不是按逻辑方案聚合”问题
     - 纠正 emotion 的 anchor-A 判据和 experimental 推荐污染问题
+    - 支持显式 `--device cpu` / `--device cuda:0`
 - `emotion` 正式实验部分完成:
   - CPU 受限续跑后已完成:
     - 限制: `<=96` 核, `<=48G` 内存
@@ -359,6 +366,7 @@ OMP_NUM_THREADS=96 MKL_NUM_THREADS=96 OPENBLAS_NUM_THREADS=96 NUMEXPR_NUM_THREAD
 VECLIB_MAXIMUM_THREADS=96 RAYON_NUM_THREADS=96 \
 taskset -c 0-95 prlimit --as=51539607552 -- \
 .venv/bin/python tools/stable_speaker_fusion_run.py \
+  --device cpu \
   --manifest artifacts/speaker_fusion_emotion_screen_trim6/manifest.jsonl \
   --results-path artifacts/speaker_fusion_emotion_screen_trim6/run_results_stable.jsonl \
   --reload-every 4 \
@@ -373,6 +381,7 @@ OMP_NUM_THREADS=96 MKL_NUM_THREADS=96 OPENBLAS_NUM_THREADS=96 NUMEXPR_NUM_THREAD
 VECLIB_MAXIMUM_THREADS=96 RAYON_NUM_THREADS=96 \
 taskset -c 0-95 prlimit --as=51539607552 -- \
 .venv/bin/python tools/score_emotion_stable.py \
+  --device cpu \
   --manifest artifacts/speaker_fusion_emotion_screen_trim6/manifest.jsonl \
   --results-path artifacts/speaker_fusion_emotion_screen_trim6/run_results_stable.jsonl
 ```

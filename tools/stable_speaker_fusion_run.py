@@ -46,11 +46,12 @@ def release_tts(tts: Any) -> None:
     safe_empty_cuda_cache()
 
 
-def build_tts(cfg_path: str, model_dir: str) -> IndexTTS2:
+def build_tts(cfg_path: str, model_dir: str, device: str | None = None) -> IndexTTS2:
     return IndexTTS2(
         cfg_path=cfg_path,
         model_dir=model_dir,
         use_fp16=False,
+        device=device,
         use_cuda_kernel=False,
         use_deepspeed=False,
     )
@@ -65,6 +66,7 @@ def main() -> None:
     parser.add_argument("--reload-every", type=int, default=8)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--continue-on-error", action="store_true")
+    parser.add_argument("--device", choices=["cpu", "cuda:0"], default=None)
     args = parser.parse_args()
 
     manifest_path = Path(args.manifest)
@@ -93,7 +95,7 @@ def main() -> None:
             if tts is None or processed_since_reload >= args.reload_every:
                 release_tts(tts)
                 print(f"RELOAD model before case {idx}: {row['case_id']}", flush=True)
-                tts = build_tts(args.cfg_path, args.model_dir)
+                tts = build_tts(args.cfg_path, args.model_dir, device=args.device)
                 processed_since_reload = 0
 
             print(f"[{idx}/{len(rows)}] {row['case_id']}", flush=True)

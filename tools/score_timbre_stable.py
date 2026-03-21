@@ -128,6 +128,7 @@ def main() -> None:
     parser.add_argument("--results-path")
     parser.add_argument("--cfg-path", default="checkpoints/config.yaml")
     parser.add_argument("--model-dir", default="checkpoints")
+    parser.add_argument("--device", choices=["cpu", "cuda:0"], default=None)
     parser.add_argument("--use-fp16", action="store_true")
     parser.add_argument("--no-fp16", action="store_true")
     args = parser.parse_args()
@@ -146,6 +147,7 @@ def main() -> None:
         cfg_path=args.cfg_path,
         model_dir=args.model_dir,
         use_fp16=use_fp16,
+        device=args.device,
         use_cuda_kernel=False,
         use_deepspeed=False,
     )
