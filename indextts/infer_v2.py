@@ -38,16 +38,18 @@ import random
 import torch.nn.functional as F
 
 from indextts.fusion import (
-    EXPERIMENTAL_FUSION_LEVELS,
-    SUPPORTED_FUSION_LEVELS,
     FusionRecipe,
     branch_anchor_mode,
     branch_operator,
     branch_references,
+    build_rollout_fusion_recipe,
+    combine_reference_paths,
     coerce_fusion_recipe,
     normalize_weights,
     recipe_cache_token,
     recipe_metadata,
+    SUPPORTED_EMOTION_FUSION_MODES,
+    SUPPORTED_SPEAKER_FUSION_MODES,
 )
 
 class IndexTTS2:
@@ -901,13 +903,70 @@ class IndexTTS2:
         with open(metadata_output_path, "w", encoding="utf-8") as file_obj:
             json.dump(metadata, file_obj, ensure_ascii=False, indent=2)
 
+    def _normalize_rollout_reference_inputs(
+        self,
+        primary_prompt: Any,
+        references: Optional[Sequence[str]],
+    ) -> Tuple[Any, Optional[Sequence[str]], bool]:
+        if references is None and isinstance(primary_prompt, (list, tuple)):
+            prompt_list = [str(path).strip() for path in primary_prompt if str(path).strip()]
+            if not prompt_list:
+                raise ValueError("Reference prompt list must not be empty.")
+            return prompt_list[0], prompt_list, True
+        return primary_prompt, references, False
+
+    def _resolve_requested_fusion_recipe(
+        self,
+        spk_audio_prompt: Any,
+        emo_audio_prompt: Any,
+        fusion_recipe: Optional[FusionRecipe],
+        speaker_references: Optional[Sequence[str]],
+        speaker_reference_weights: Optional[Sequence[float]],
+        speaker_fusion_mode: str,
+        emotion_references: Optional[Sequence[str]],
+        emotion_reference_weights: Optional[Sequence[float]],
+        emotion_fusion_mode: str,
+        diffusion_steps: int,
+        inference_cfg_rate: float,
+    ) -> Tuple[str, Optional[str], Optional[Sequence[str]], Optional[Sequence[str]], Optional[FusionRecipe]]:
+        spk_audio_prompt, speaker_references, used_speaker_list_shorthand = self._normalize_rollout_reference_inputs(
+            spk_audio_prompt,
+            speaker_references,
+        )
+        emo_audio_prompt, emotion_references, used_emotion_list_shorthand = self._normalize_rollout_reference_inputs(
+            emo_audio_prompt,
+            emotion_references,
+        )
+        recipe = coerce_fusion_recipe(fusion_recipe)
+        if recipe is not None:
+            return spk_audio_prompt, emo_audio_prompt, speaker_references, emotion_references, recipe
+
+        recipe = build_rollout_fusion_recipe(
+            speaker_references=combine_reference_paths(spk_audio_prompt, speaker_references),
+            speaker_reference_weights=speaker_reference_weights,
+            speaker_fusion_mode=speaker_fusion_mode,
+            emotion_references=combine_reference_paths(emo_audio_prompt, emotion_references),
+            emotion_reference_weights=emotion_reference_weights,
+            emotion_fusion_mode=emotion_fusion_mode,
+            diffusion_steps=diffusion_steps,
+            inference_cfg_rate=inference_cfg_rate,
+            metadata={
+                "speaker_prompt_list_shorthand": used_speaker_list_shorthand,
+                "emotion_prompt_list_shorthand": used_emotion_list_shorthand,
+            },
+        )
+        return spk_audio_prompt, emo_audio_prompt, speaker_references, emotion_references, recipe
+
     # 原始推理模式
     def infer(self, spk_audio_prompt, text, output_path,
               emo_audio_prompt=None, emo_alpha=1.0,
               emo_vector=None,
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
               verbose=False, max_text_tokens_per_segment=120, stream_return=False, more_segment_before=0,
-              fusion_recipe=None, return_metadata=False, metadata_output_path=None, **generation_kwargs):
+              fusion_recipe=None,
+              speaker_references=None, speaker_reference_weights=None, speaker_fusion_mode="default",
+              emotion_references=None, emotion_reference_weights=None, emotion_fusion_mode="default",
+              return_metadata=False, metadata_output_path=None, **generation_kwargs):
         if stream_return:
             return self.infer_generator(
                 spk_audio_prompt, text, output_path,
@@ -915,7 +974,14 @@ class IndexTTS2:
                 emo_vector,
                 use_emo_text, emo_text, use_random, interval_silence,
                 verbose, max_text_tokens_per_segment, stream_return, more_segment_before,
-                fusion_recipe=fusion_recipe, return_metadata=return_metadata,
+                fusion_recipe=fusion_recipe,
+                speaker_references=speaker_references,
+                speaker_reference_weights=speaker_reference_weights,
+                speaker_fusion_mode=speaker_fusion_mode,
+                emotion_references=emotion_references,
+                emotion_reference_weights=emotion_reference_weights,
+                emotion_fusion_mode=emotion_fusion_mode,
+                return_metadata=return_metadata,
                 metadata_output_path=metadata_output_path, **generation_kwargs
             )
         else:
@@ -926,7 +992,14 @@ class IndexTTS2:
                     emo_vector,
                     use_emo_text, emo_text, use_random, interval_silence,
                     verbose, max_text_tokens_per_segment, stream_return, more_segment_before,
-                    fusion_recipe=fusion_recipe, return_metadata=return_metadata,
+                    fusion_recipe=fusion_recipe,
+                    speaker_references=speaker_references,
+                    speaker_reference_weights=speaker_reference_weights,
+                    speaker_fusion_mode=speaker_fusion_mode,
+                    emotion_references=emotion_references,
+                    emotion_reference_weights=emotion_reference_weights,
+                    emotion_fusion_mode=emotion_fusion_mode,
+                    return_metadata=return_metadata,
                     metadata_output_path=metadata_output_path, **generation_kwargs
                 ))[0]
             except IndexError:
@@ -937,27 +1010,28 @@ class IndexTTS2:
               emo_vector=None,
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
               verbose=False, max_text_tokens_per_segment=120, stream_return=False, quick_streaming_tokens=0,
-              fusion_recipe=None, return_metadata=False, metadata_output_path=None, **generation_kwargs):
+              fusion_recipe=None,
+              speaker_references=None, speaker_reference_weights=None, speaker_fusion_mode="default",
+              emotion_references=None, emotion_reference_weights=None, emotion_fusion_mode="default",
+              return_metadata=False, metadata_output_path=None, **generation_kwargs):
         print(">> starting inference...")
         self._set_gr_progress(0, "starting inference...")
         if verbose:
             print(f"origin text:{text}, spk_audio_prompt:{spk_audio_prompt}, "
                   f"emo_audio_prompt:{emo_audio_prompt}, emo_alpha:{emo_alpha}, "
                   f"emo_vector:{emo_vector}, use_emo_text:{use_emo_text}, "
-                  f"emo_text:{emo_text}")
+                  f"emo_text:{emo_text}, speaker_references:{speaker_references}, "
+                  f"emotion_references:{emotion_references}")
         start_time = time.perf_counter()
-        if fusion_recipe is None and isinstance(spk_audio_prompt, (list, tuple)):
-            fusion_recipe = {
-                "references": list(spk_audio_prompt),
-                "enabled_levels": list(SUPPORTED_FUSION_LEVELS),
-            }
-            spk_audio_prompt = spk_audio_prompt[0]
+        requested_diffusion_steps = generation_kwargs.pop("diffusion_steps", 25)
+        requested_inference_cfg_rate = generation_kwargs.pop("inference_cfg_rate", 0.7)
         fusion_recipe = coerce_fusion_recipe(fusion_recipe)
 
         if use_emo_text or emo_vector is not None:
             # we're using a text or emotion vector guidance; so we must remove
             # "emotion reference voice", to ensure we use correct emotion mixing!
             emo_audio_prompt = None
+            emotion_references = None
 
         if use_emo_text:
             # automatically generate emotion vectors from text prompt
@@ -984,6 +1058,22 @@ class IndexTTS2:
             emo_audio_prompt = spk_audio_prompt
             # must always use alpha=1.0 when we don't have an external reference voice
             emo_alpha = 1.0
+
+        spk_audio_prompt, emo_audio_prompt, speaker_references, emotion_references, fusion_recipe = (
+            self._resolve_requested_fusion_recipe(
+                spk_audio_prompt,
+                emo_audio_prompt,
+                fusion_recipe,
+                speaker_references,
+                speaker_reference_weights,
+                speaker_fusion_mode,
+                emotion_references,
+                emotion_reference_weights,
+                emotion_fusion_mode,
+                requested_diffusion_steps,
+                requested_inference_cfg_rate,
+            )
+        )
 
         # 如果参考音频改变了，才需要重新生成, 提升速度
         if self.cache_spk_cond is None or self.cache_spk_audio_prompt != spk_audio_prompt:
@@ -1115,11 +1205,11 @@ class IndexTTS2:
         repetition_penalty = generation_kwargs.pop("repetition_penalty", 10.0)
         max_mel_tokens = generation_kwargs.pop("max_mel_tokens", 1500)
         sampling_rate = 22050
-        diffusion_steps = fusion_recipe.diffusion_steps if fusion_recipe is not None else generation_kwargs.pop("diffusion_steps", 25)
+        diffusion_steps = fusion_recipe.diffusion_steps if fusion_recipe is not None else requested_diffusion_steps
         inference_cfg_rate = (
             fusion_recipe.inference_cfg_rate
             if fusion_recipe is not None
-            else generation_kwargs.pop("inference_cfg_rate", 0.7)
+            else requested_inference_cfg_rate
         )
 
         wavs = []
@@ -1132,7 +1222,19 @@ class IndexTTS2:
         run_metadata = {
             "text": text,
             "speaker_prompt": spk_audio_prompt,
+            "speaker_references": list(combine_reference_paths(spk_audio_prompt, speaker_references)),
+            "speaker_fusion_mode": (
+                (speaker_fusion_mode or "default").strip().lower()
+                if (speaker_fusion_mode or "default").strip().lower() in SUPPORTED_SPEAKER_FUSION_MODES
+                else speaker_fusion_mode
+            ),
             "emotion_prompt": emo_audio_prompt,
+            "emotion_references": list(combine_reference_paths(emo_audio_prompt, emotion_references)),
+            "emotion_fusion_mode": (
+                (emotion_fusion_mode or "default").strip().lower()
+                if (emotion_fusion_mode or "default").strip().lower() in SUPPORTED_EMOTION_FUSION_MODES
+                else emotion_fusion_mode
+            ),
             "emotion_alpha": emo_alpha,
             "emotion_vector": emo_vector,
             "fusion": fusion_metadata,

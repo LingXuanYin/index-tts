@@ -252,7 +252,44 @@ text = "Translate for me, what is a surprise!"
 tts.infer(spk_audio_prompt='examples/voice_01.wav', text=text, output_path="gen.wav", verbose=True)
 ```
 
-2. 指定情感参考音频：
+2. 使用正式支持的多参考音色 / 情感融合预设：
+
+```python
+from indextts.infer_v2 import IndexTTS2
+
+tts = IndexTTS2(
+    cfg_path="checkpoints/config.yaml",
+    model_dir="checkpoints",
+    use_fp16=False,
+    use_cuda_kernel=False,
+    use_deepspeed=False,
+)
+text = "本例使用正式支持的多参考音色与多参考情感融合。"
+tts.infer(
+    spk_audio_prompt="path/to/timbre_a.wav",
+    speaker_references=[
+        "path/to/timbre_b.wav",
+    ],
+    speaker_fusion_mode="default",
+    emo_audio_prompt="path/to/emotion_a.wav",
+    emotion_references=[
+        "path/to/emotion_b.wav",
+    ],
+    emotion_fusion_mode="default",
+    text=text,
+    output_path="gen_multiref.wav",
+    verbose=True,
+)
+```
+
+正式预设含义：
+
+- 音色 `default`: `spk_cond_emb + speech_conditioning_latent`
+- 音色 `fallback`: `speech_conditioning_latent`
+- 情感 `default`: `A` 锚定
+- 情感 `fallback`: `symmetric`
+
+3. 指定情感参考音频：
 
 ```python
 from indextts.infer_v2 import IndexTTS2
@@ -261,7 +298,7 @@ text = "酒楼丧尽天良，开始借机竞拍房间，哎，一群蠢货。"
 tts.infer(spk_audio_prompt='examples/voice_07.wav', text=text, output_path="gen.wav", emo_audio_prompt="examples/emo_sad.wav", verbose=True)
 ```
 
-3. 可调节情感参考音频的权重（`emo_alpha`，范围0.0-1.0，默认1.0）：
+4. 可调节情感参考音频的权重（`emo_alpha`，范围0.0-1.0，默认1.0）：
 
 ```python
 from indextts.infer_v2 import IndexTTS2
@@ -270,7 +307,7 @@ text = "酒楼丧尽天良，开始借机竞拍房间，哎，一群蠢货。"
 tts.infer(spk_audio_prompt='examples/voice_07.wav', text=text, output_path="gen.wav", emo_audio_prompt="examples/emo_sad.wav", emo_alpha=0.9, verbose=True)
 ```
 
-4. 可直接指定8维情感向量 `[高兴, 愤怒, 悲伤, 害怕, 厌恶, 忧郁, 惊讶, 平静]`，可用`use_random`开启随机情感采样（默认False）：
+5. 可直接指定8维情感向量 `[高兴, 愤怒, 悲伤, 害怕, 厌恶, 忧郁, 惊讶, 平静]`，可用`use_random`开启随机情感采样（默认False）：
 
 > [!NOTE]
 > 开启随机采样会降低音色的还原度。
@@ -282,7 +319,7 @@ text = "哇塞！这个爆率也太高了！欧皇附体了！"
 tts.infer(spk_audio_prompt='examples/voice_10.wav', text=text, output_path="gen.wav", emo_vector=[0, 0, 0, 0, 0, 0, 0.45, 0], use_random=False, verbose=True)
 ```
 
-5. 可用`use_emo_text`根据文本自动生成情感向量，可用`use_random`开启随机情感采样：
+6. 可用`use_emo_text`根据文本自动生成情感向量，可用`use_random`开启随机情感采样：
 
 ```python
 from indextts.infer_v2 import IndexTTS2
@@ -291,7 +328,7 @@ text = "快躲起来！是他要来了！他要来抓我们了！"
 tts.infer(spk_audio_prompt='examples/voice_12.wav', text=text, output_path="gen.wav", emo_alpha=0.6, use_emo_text=True, use_random=False, verbose=True)
 ```
 
-6. 可直接指定情感文本描述（`emo_text`），实现文本与情感分离控制：
+7. 可直接指定情感文本描述（`emo_text`），实现文本与情感分离控制：
 
 ```python
 from indextts.infer_v2 import IndexTTS2
@@ -300,6 +337,31 @@ text = "快躲起来！是他要来了！他要来抓我们了！"
 emo_text = "你吓死我了！你是鬼吗？"
 tts.infer(spk_audio_prompt='examples/voice_12.wav', text=text, output_path="gen.wav", emo_alpha=0.6, use_emo_text=True, emo_text=emo_text, use_random=False, verbose=True)
 ```
+
+### 命令行使用 IndexTTS2
+
+单参考：
+
+```bash
+uv run indextts "你好，IndexTTS2" \
+  --voice data/open_source/cmu_arctic/ARCTIC/cmu_us_lnh_arctic/wav/arctic_a0457.wav \
+  --output_path outputs/cli_single.wav
+```
+
+正式支持的多参考融合：
+
+```bash
+uv run indextts "这是一个正式支持的多参考融合示例。" \
+  --voice path/to/timbre_a.wav \
+  --voice-ref path/to/timbre_b.wav \
+  --speaker-fusion-mode default \
+  --emotion path/to/emotion_a.wav \
+  --emotion-ref path/to/emotion_b.wav \
+  --emotion-fusion-mode default \
+  --output_path outputs/cli_multiref.wav
+```
+
+如果需要更细粒度控制，Python API 仍然保留 `fusion_recipe` 高级入口。
 
 > [!TIP]
 > **拼音使用注意事项:**
@@ -396,4 +458,3 @@ IndexTTS:
   url={https://arxiv.org/abs/2502.05512}
 }
 ```
-

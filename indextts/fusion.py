@@ -1,7 +1,7 @@
 import hashlib
 import json
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 SUPPORTED_FUSION_LEVELS = (
@@ -25,6 +25,47 @@ BRANCH_NAMES = (
     "ref_mel",
     "emotion",
 )
+
+SUPPORTED_SPEAKER_FUSION_MODES = (
+    "default",
+    "fallback",
+)
+
+SUPPORTED_EMOTION_FUSION_MODES = (
+    "default",
+    "fallback",
+)
+
+DEFAULT_TIMBRE_FUSION_LEVELS = (
+    "spk_cond_emb",
+    "speech_conditioning_latent",
+)
+
+FALLBACK_TIMBRE_FUSION_LEVELS = (
+    "speech_conditioning_latent",
+)
+
+TIMBRE_FUSION_PRESETS = {
+    "default": {
+        "enabled_levels": DEFAULT_TIMBRE_FUSION_LEVELS,
+        "anchor_mode": "symmetric",
+    },
+    "fallback": {
+        "enabled_levels": FALLBACK_TIMBRE_FUSION_LEVELS,
+        "anchor_mode": "symmetric",
+    },
+}
+
+EMOTION_FUSION_PRESETS = {
+    "default": {
+        "anchor_mode": "A",
+        "operator": "weighted_sum",
+    },
+    "fallback": {
+        "anchor_mode": "symmetric",
+        "operator": "weighted_sum",
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -245,3 +286,133 @@ def recipe_cache_token(
     }
     encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True).encode("utf-8")
     return hashlib.sha1(encoded).hexdigest()
+
+
+def _coerce_reference_paths(items: Optional[Iterable[Any]]) -> Tuple[str, ...]:
+    if items is None:
+        return ()
+    if isinstance(items, (str, FusionReference, dict)):
+        items = [items]
+
+    paths: List[str] = []
+    for item in items:
+        if isinstance(item, FusionReference):
+            path = item.path
+        elif isinstance(item, dict):
+            path = item.get("path")
+        else:
+            path = item
+        if path is None:
+            continue
+        path_text = str(path).strip()
+        if path_text:
+            paths.append(path_text)
+    return tuple(paths)
+
+
+def combine_reference_paths(primary_path: Optional[Any], references: Optional[Iterable[Any]]) -> Tuple[str, ...]:
+    ordered: List[str] = []
+    seen = set()
+    primary_paths = _coerce_reference_paths(primary_path)
+    extra_paths = _coerce_reference_paths(references)
+    for path in primary_paths + extra_paths:
+        if path not in seen:
+            ordered.append(path)
+            seen.add(path)
+    return tuple(ordered)
+
+
+def _build_weighted_references(
+    paths: Tuple[str, ...],
+    weights: Optional[Sequence[float]],
+) -> Tuple[FusionReference, ...]:
+    if not paths:
+        return ()
+    if weights is not None and len(weights) != len(paths):
+        raise ValueError(
+            f"Reference weights length ({len(weights)}) must match reference count ({len(paths)})."
+        )
+    refs: List[FusionReference] = []
+    for idx, path in enumerate(paths):
+        refs.append(FusionReference(path=path, weight=1.0 if weights is None else float(weights[idx])))
+    return tuple(refs)
+
+
+def _normalize_fusion_mode(mode: Optional[str], allowed: Tuple[str, ...], field_name: str) -> str:
+    normalized = (mode or "default").strip().lower()
+    if normalized not in allowed:
+        allowed_text = ", ".join(allowed)
+        raise ValueError(f"Unknown {field_name}: {mode!r}. Allowed values: {allowed_text}.")
+    return normalized
+
+
+def build_rollout_fusion_recipe(
+    speaker_references: Optional[Iterable[Any]] = None,
+    speaker_reference_weights: Optional[Sequence[float]] = None,
+    speaker_fusion_mode: str = "default",
+    emotion_references: Optional[Iterable[Any]] = None,
+    emotion_reference_weights: Optional[Sequence[float]] = None,
+    emotion_fusion_mode: str = "default",
+    diffusion_steps: int = 25,
+    inference_cfg_rate: float = 0.7,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[FusionRecipe]:
+    speaker_paths = _coerce_reference_paths(speaker_references)
+    emotion_paths = _coerce_reference_paths(emotion_references)
+    use_speaker_fusion = len(speaker_paths) >= 2
+    use_emotion_fusion = len(emotion_paths) >= 2
+    if not use_speaker_fusion and not use_emotion_fusion:
+        return None
+
+    speaker_mode = _normalize_fusion_mode(
+        speaker_fusion_mode,
+        SUPPORTED_SPEAKER_FUSION_MODES,
+        "speaker_fusion_mode",
+    )
+    emotion_mode = _normalize_fusion_mode(
+        emotion_fusion_mode,
+        SUPPORTED_EMOTION_FUSION_MODES,
+        "emotion_fusion_mode",
+    )
+
+    branch_configs: Dict[str, FusionBranchConfig] = {}
+
+    if use_speaker_fusion:
+        speaker_refs = _build_weighted_references(speaker_paths, speaker_reference_weights)
+        branch_configs["speaker"] = FusionBranchConfig(
+            references=speaker_refs,
+            levels=TIMBRE_FUSION_PRESETS[speaker_mode]["enabled_levels"],
+            anchor_mode=TIMBRE_FUSION_PRESETS[speaker_mode]["anchor_mode"],
+            operator="weighted_sum",
+        )
+
+    if use_emotion_fusion:
+        emotion_refs = _build_weighted_references(emotion_paths, emotion_reference_weights)
+        branch_configs["emotion"] = FusionBranchConfig(
+            references=emotion_refs,
+            levels=(),
+            anchor_mode=EMOTION_FUSION_PRESETS[emotion_mode]["anchor_mode"],
+            operator=EMOTION_FUSION_PRESETS[emotion_mode]["operator"],
+        )
+
+    recipe_metadata_dict = dict(metadata or {})
+    recipe_metadata_dict.setdefault("rollout", {})
+    recipe_metadata_dict["rollout"].update(
+        {
+            "preset_source": "rollout",
+            "speaker_fusion_mode": speaker_mode if use_speaker_fusion else None,
+            "emotion_fusion_mode": emotion_mode if use_emotion_fusion else None,
+            "speaker_reference_count": len(speaker_paths),
+            "emotion_reference_count": len(emotion_paths),
+            "timbre_levels": list(branch_configs["speaker"].levels) if "speaker" in branch_configs else [],
+        }
+    )
+
+    return FusionRecipe(
+        references=(),
+        enabled_levels=(),
+        branch_configs=branch_configs,
+        diffusion_steps=int(diffusion_steps),
+        inference_cfg_rate=float(inference_cfg_rate),
+        metadata=recipe_metadata_dict,
+    )

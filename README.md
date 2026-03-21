@@ -275,6 +275,13 @@ uv run webui.py -h
 
 Have fun!
 
+The WebUI now also exposes supported multi-reference fusion controls:
+
+- timbre fusion preset: `default` or `fallback`
+- extra timbre references: one local audio path per line
+- emotion fusion preset: `default` or `fallback`
+- extra emotion references: one local audio path per line when emotion-reference mode is enabled
+
 > [!IMPORTANT]
 > It can be very helpful to use **FP16** (half-precision) inference. It is faster
 > and uses less VRAM, with a very small quality loss.
@@ -313,7 +320,44 @@ text = "Translate for me, what is a surprise!"
 tts.infer(spk_audio_prompt='examples/voice_01.wav', text=text, output_path="gen.wav", verbose=True)
 ```
 
-2. Using a separate, emotional reference audio file to condition the speech synthesis:
+2. Use the supported multi-reference timbre and emotion presets:
+
+```python
+from indextts.infer_v2 import IndexTTS2
+
+tts = IndexTTS2(
+    cfg_path="checkpoints/config.yaml",
+    model_dir="checkpoints",
+    use_fp16=False,
+    use_cuda_kernel=False,
+    use_deepspeed=False,
+)
+text = "Blend the timbre from both references while keeping the emotion references separate."
+tts.infer(
+    spk_audio_prompt="path/to/timbre_a.wav",
+    speaker_references=[
+        "path/to/timbre_b.wav",
+    ],
+    speaker_fusion_mode="default",
+    emo_audio_prompt="path/to/emotion_a.wav",
+    emotion_references=[
+        "path/to/emotion_b.wav",
+    ],
+    emotion_fusion_mode="default",
+    text=text,
+    output_path="gen_multiref.wav",
+    verbose=True,
+)
+```
+
+Supported preset meanings:
+
+- timbre `default`: `spk_cond_emb + speech_conditioning_latent`
+- timbre `fallback`: `speech_conditioning_latent`
+- emotion `default`: anchor `A`
+- emotion `fallback`: anchor `symmetric`
+
+3. Using a separate, emotional reference audio file to condition the speech synthesis:
 
 ```python
 from indextts.infer_v2 import IndexTTS2
@@ -322,7 +366,7 @@ text = "酒楼丧尽天良，开始借机竞拍房间，哎，一群蠢货。"
 tts.infer(spk_audio_prompt='examples/voice_07.wav', text=text, output_path="gen.wav", emo_audio_prompt="examples/emo_sad.wav", verbose=True)
 ```
 
-3. When an emotional reference audio file is specified, you can optionally set
+4. When an emotional reference audio file is specified, you can optionally set
    the `emo_alpha` to adjust how much it affects the output.
    Valid range is `0.0 - 1.0`, and the default value is `1.0` (100%):
 
@@ -333,7 +377,7 @@ text = "酒楼丧尽天良，开始借机竞拍房间，哎，一群蠢货。"
 tts.infer(spk_audio_prompt='examples/voice_07.wav', text=text, output_path="gen.wav", emo_audio_prompt="examples/emo_sad.wav", emo_alpha=0.9, verbose=True)
 ```
 
-4. It's also possible to omit the emotional reference audio and instead provide
+5. It's also possible to omit the emotional reference audio and instead provide
    an 8-float list specifying the intensity of each emotion, in the following order:
    `[happy, angry, sad, afraid, disgusted, melancholic, surprised, calm]`.
    You can additionally use the `use_random` parameter to introduce stochasticity
@@ -351,7 +395,7 @@ text = "哇塞！这个爆率也太高了！欧皇附体了！"
 tts.infer(spk_audio_prompt='examples/voice_10.wav', text=text, output_path="gen.wav", emo_vector=[0, 0, 0, 0, 0, 0, 0.45, 0], use_random=False, verbose=True)
 ```
 
-5. Alternatively, you can enable `use_emo_text` to guide the emotions based on
+6. Alternatively, you can enable `use_emo_text` to guide the emotions based on
    your provided `text` script. Your text script will then automatically
    be converted into emotion vectors.
    It's recommended to use `emo_alpha` around 0.6 (or lower) when using the text
@@ -366,7 +410,7 @@ text = "快躲起来！是他要来了！他要来抓我们了！"
 tts.infer(spk_audio_prompt='examples/voice_12.wav', text=text, output_path="gen.wav", emo_alpha=0.6, use_emo_text=True, use_random=False, verbose=True)
 ```
 
-6. It's also possible to directly provide a specific text emotion description
+7. It's also possible to directly provide a specific text emotion description
    via the `emo_text` parameter. Your emotion text will then automatically be
    converted into emotion vectors. This gives you separate control of the text
    script and the text emotion description:
@@ -378,6 +422,31 @@ text = "快躲起来！是他要来了！他要来抓我们了！"
 emo_text = "你吓死我了！你是鬼吗？"
 tts.infer(spk_audio_prompt='examples/voice_12.wav', text=text, output_path="gen.wav", emo_alpha=0.6, use_emo_text=True, emo_text=emo_text, use_random=False, verbose=True)
 ```
+
+#### 💻 Using IndexTTS2 from the CLI
+
+Single-reference inference:
+
+```bash
+uv run indextts "Hello from IndexTTS2" \
+  --voice data/open_source/cmu_arctic/ARCTIC/cmu_us_lnh_arctic/wav/arctic_a0457.wav \
+  --output_path outputs/cli_single.wav
+```
+
+Supported multi-reference timbre and emotion rollout:
+
+```bash
+uv run indextts "This is a supported multi-reference rollout example." \
+  --voice path/to/timbre_a.wav \
+  --voice-ref path/to/timbre_b.wav \
+  --speaker-fusion-mode default \
+  --emotion path/to/emotion_a.wav \
+  --emotion-ref path/to/emotion_b.wav \
+  --emotion-fusion-mode default \
+  --output_path outputs/cli_multiref.wav
+```
+
+For expert control beyond the supported presets, the Python API still accepts `fusion_recipe`.
 
 > [!TIP]
 > **Pinyin Usage Notes:**

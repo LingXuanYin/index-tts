@@ -126,6 +126,8 @@ def format_glossary_markdown():
 
 def gen_single(emo_control_method,prompt, text,
                emo_ref_path, emo_weight,
+               speaker_fusion_mode, speaker_reference_paths,
+               emotion_fusion_mode, emotion_reference_paths,
                vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
                emo_text,emo_random,
                max_text_tokens_per_segment=120,
@@ -166,11 +168,23 @@ def gen_single(emo_control_method,prompt, text,
         # erase empty emotion descriptions; `infer()` will then automatically use the main prompt
         emo_text = None
 
+    def parse_reference_paths(value):
+        if not value:
+            return []
+        return [line.strip() for line in value.splitlines() if line.strip()]
+
+    speaker_references = parse_reference_paths(speaker_reference_paths)
+    emotion_references = parse_reference_paths(emotion_reference_paths)
+
     print(f"Emo control mode:{emo_control_method},weight:{emo_weight},vec:{vec}")
     output = tts.infer(spk_audio_prompt=prompt, text=text,
                        output_path=output_path,
                        emo_audio_prompt=emo_ref_path, emo_alpha=emo_weight,
                        emo_vector=vec,
+                       speaker_references=speaker_references,
+                       speaker_fusion_mode=speaker_fusion_mode,
+                       emotion_references=emotion_references,
+                       emotion_fusion_mode=emotion_fusion_mode,
                        use_emo_text=(emo_control_method==3), emo_text=emo_text,use_random=emo_random,
                        verbose=cmd_args.verbose,
                        max_text_tokens_per_segment=int(max_text_tokens_per_segment),
@@ -214,6 +228,21 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             experimental_checkbox = gr.Checkbox(label=i18n("显示实验功能"), value=False)
             glossary_checkbox = gr.Checkbox(label=i18n("开启术语词汇读音"), value=tts.normalizer.enable_glossary)
         with gr.Accordion(i18n("功能设置")):
+            with gr.Accordion(i18n("多参考融合"), open=False):
+                gr.Markdown(i18n("主参考音频始终会作为第一个参考输入；附加参考路径每行填写一个本地音频文件。"))
+                with gr.Row():
+                    speaker_fusion_mode = gr.Radio(
+                        choices=["default", "fallback"],
+                        value="default",
+                        label=i18n("音色融合预设"),
+                        info=i18n("default 为推荐方案，fallback 为稳定回退方案"),
+                    )
+                speaker_reference_paths = gr.Textbox(
+                    label=i18n("附加音色参考路径"),
+                    lines=3,
+                    placeholder=i18n("每行一个音频路径"),
+                    value="",
+                )
             # 情感控制选项部分
             with gr.Row():
                 emo_control_method = gr.Radio(
@@ -232,6 +261,18 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
         with gr.Group(visible=False) as emotion_reference_group:
             with gr.Row():
                 emo_upload = gr.Audio(label=i18n("上传情感参考音频"), type="filepath")
+            emotion_fusion_mode = gr.Radio(
+                choices=["default", "fallback"],
+                value="default",
+                label=i18n("情感融合预设"),
+                info=i18n("default 为推荐方案，fallback 为稳定回退方案"),
+            )
+            emotion_reference_paths = gr.Textbox(
+                label=i18n("附加情感参考路径"),
+                lines=3,
+                placeholder=i18n("每行一个音频路径"),
+                value="",
+            )
 
         # 情感随机采样
         with gr.Row(visible=False) as emotion_randomize_group:
@@ -543,6 +584,8 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
 
     gen_button.click(gen_single,
                      inputs=[emo_control_method,prompt_audio, input_text_single, emo_upload, emo_weight,
+                            speaker_fusion_mode, speaker_reference_paths,
+                            emotion_fusion_mode, emotion_reference_paths,
                             vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
                              emo_text,emo_random,
                              max_text_tokens_per_segment,
