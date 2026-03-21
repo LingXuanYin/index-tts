@@ -1,154 +1,172 @@
 ## Context
 
-The experiment-oriented fusion work for IndexTTS v2 is already present in [`indextts/infer_v2.py`](../../../indextts/infer_v2.py), [`indextts/fusion.py`](../../../indextts/fusion.py), and the related scoring/handoff documents. The project has also already converged on supported defaults:
+The completed no-training fusion experiment already selected stable rollout defaults for `IndexTTS2`:
 
 - timbre default: `spk_cond_emb + speech_conditioning_latent`
 - timbre fallback: `speech_conditioning_latent`
 - emotion default: `emotion_tensor_anchor_a`
 - emotion fallback: `emotion_tensor_sym`
 
-However, the repository still exposes this mostly as low-level `fusion_recipe` control plus experiment tooling. Public surfaces are inconsistent:
+The current repository already contains the low-level fusion runtime in `indextts/fusion.py` and the supporting tensor override path in `indextts/infer_v2.py`, but the public project surfaces still behave as if fusion were an internal or experiment-only feature. In practice, the gap is now productization rather than model research:
 
-- Python runtime accepts `fusion_recipe`, but only provides a shorthand for `spk_audio_prompt` as a list and that shorthand enables every supported level instead of the selected default.
-- WebUI exposes only a single timbre reference and a single emotion reference.
-- CLI still targets the older runtime path and does not provide IndexTTS v2 multi-reference controls.
-- README does not document the supported rollout behavior.
+- Python callers still have to understand raw `fusion_recipe` details to use the selected defaults explicitly.
+- `webui.py` still presents single-reference speaker flow.
+- `indextts/cli.py` still targets the older `IndexTTS` entrypoint and has no formal `IndexTTS2` multi-reference path.
+- project docs describe single-reference usage, not the supported default multi-reference workflow.
+- the existing tests focus on experiment tooling, not the rollout-facing API and interfaces.
 
-This rollout crosses runtime, interface, docs, and test boundaries. It also needs strong recovery artifacts because the user explicitly requires branch-scoped, document-backed progress that survives compaction or interruption.
+This rollout must keep timbre and emotion variables separated, preserve current single-reference behavior, and avoid promoting unstable `ref_mel` routes into the supported default path. The local development convention for this work is repo-root `.venv`; Windows-oriented developer guidance should be documented, but the current validation environment remains the checked-out workspace.
+
+Current execution snapshot before implementation:
+
+- active mode: `parallel`
+- branch: `multiref-fusion-rollout`
+- blockers: no hard blocker; interface ergonomics still need to be fixed in design
+- next intended step: finish rollout artifacts, then implement runtime, interface, docs, and validation changes
 
 ## Goals / Non-Goals
 
 **Goals:**
-- Expose stable multi-reference timbre and emotion fusion as formal project behavior.
-- Encode the selected supported defaults and supported fallbacks as named presets.
-- Keep timbre and emotion multi-reference inputs separated at the public API boundary.
-- Preserve legacy single-reference inference behavior when no multi-reference input is provided.
-- Update Python runtime, WebUI, CLI, README, and tests together.
-- Make rollout progress recoverable from repository documents.
+
+- add rollout-facing convenience inputs for multi-timbre and multi-emotion reference fusion without requiring users to hand-author a full `fusion_recipe`
+- keep raw `fusion_recipe` support for advanced users and for backwards-compatible access to existing fusion internals
+- encode the selected default and fallback presets directly in reusable helper builders
+- update current project surfaces that already expose inference behavior: Python API, CLI, WebUI, README, and Chinese docs
+- add unit and smoke-level end-to-end validation for single-reference compatibility and the new multi-reference presets
+- keep recovery state in tracked documents so future compacted sessions can resume safely
 
 **Non-Goals:**
-- Expanding the public default path to unstable `ref_mel`-based fusion.
-- Replacing `fusion_recipe` as the expert escape hatch.
-- Exposing the full experiment matrix directly in the normal UI.
-- Adding retraining, new models, or new external inference dependencies.
+
+- re-running the fusion search or changing the experimentally selected defaults during this rollout
+- promoting `ref_mel`-based supported defaults into the formal supported path
+- introducing new model dependencies, retraining, or external serving infrastructure
+- exposing the full experiment matrix through the first-rollout CLI or WebUI
 
 ## Decisions
 
-### 1. Add rollout presets instead of making raw branch configuration the primary public contract
+### 1. Add convenience preset builders on top of `fusion_recipe`
 
-The runtime will expose first-class convenience inputs for multi-reference timbre and emotion fusion and will internally build a `FusionRecipe` from supported presets.
+The runtime will keep `fusion_recipe` as the expert-level override, but rollout-facing APIs will add higher-level parameters that build the supported recipe automatically from the selected defaults or fallback presets.
 
-Planned public shape:
+The first formal surface will expose separate convenience concepts:
 
-- `speaker_references`
-- `speaker_reference_weights`
-- `speaker_fusion_mode`
-- `emotion_references`
-- `emotion_reference_weights`
-- `emotion_fusion_mode`
-- `fusion_recipe` remains supported for advanced callers
+- timbre multi-reference inputs
+- emotion multi-reference inputs
+- preset selectors for each axis
 
 Rationale:
-- The experiment has already selected defaults, so normal users should not need to author branch-level tensor settings.
-- Presets let the project guarantee stable supported behavior while keeping `fusion_recipe` for expert workflows.
-- This keeps timbre and emotion variables explicitly separated, which matches the experiment design and the user requirement.
+
+- users need a supported path that reflects experiment conclusions directly
+- existing fusion internals are already expressive enough and should not be duplicated
+- keeping the builder layer thin reduces regression risk and preserves advanced access
 
 Alternatives considered:
-- Keep only `fusion_recipe`.
-  Rejected because rollout would still depend on internal knowledge and remain too easy to misconfigure.
-- Hide `fusion_recipe` entirely.
-  Rejected because experiment and expert workflows still need it.
 
-### 2. Encode timbre and emotion defaults as separate preset builders
+- expose only raw `fusion_recipe`
+  rejected because the rollout goal is to remove experiment knowledge from ordinary usage
+- remove `fusion_recipe` and support only presets
+  rejected because it would regress advanced use and internal tooling flexibility
 
-The runtime will build the final `FusionRecipe` by composing a timbre preset and an emotion preset rather than using one monolithic preset identifier.
+### 2. Keep timbre and emotion axes separate in both API shape and recipe construction
 
-Planned supported presets:
+The convenience API will not accept one undifferentiated multi-reference list. Instead it will distinguish:
 
-- timbre:
-  - `default` -> `spk_cond_emb + speech_conditioning_latent`, symmetric anchor, symmetric weights by default
-  - `fallback` -> `speech_conditioning_latent`, symmetric anchor, symmetric weights by default
-- emotion:
-  - `default` -> anchor `A`, weighted sum, symmetric weights by default
-  - `fallback` -> anchor `symmetric`, weighted sum, symmetric weights by default
+- speaker/timbre references for timbre fusion
+- emotion references for emotion fusion
+
+If only timbre references are provided, the emotion path remains legacy-compatible unless explicitly overridden. If only emotion references are provided, the speaker path remains legacy-compatible.
 
 Rationale:
-- Timbre and emotion were evaluated separately and must remain independently controllable.
-- The implementation already supports branch-specific configuration, so composition is lower risk than a second recipe system.
+
+- the experiment design explicitly separated variables
+- the default timbre and emotion schemes differ in levels, anchor policy, and fallback behavior
+- separate inputs make tests and docs easier to reason about
 
 Alternatives considered:
-- One combined preset string such as `recommended`.
-  Rejected because it would couple timbre and emotion choices and hide the separated-variable requirement.
 
-### 3. Keep the existing single-reference path as the zero-configuration default
+- one merged reference list with branch auto-routing
+  rejected because it hides the variable boundary the experiment depended on
 
-If no multi-reference timbre or emotion inputs are supplied, inference will continue to behave as it does today.
+### 3. Encode the selected defaults in `indextts.fusion` as named supported presets
+
+The selected rollout schemes will be encoded as preset builder helpers in `indextts.fusion` so all interfaces can reuse the same source of truth. The preset layer will cover:
+
+- timbre default and fallback
+- emotion default and fallback
+- construction of a combined supported recipe when both axes are present
 
 Rationale:
-- Backward compatibility is a hard rollout requirement.
-- Existing code paths, examples, and user scripts must not break.
+
+- centralizing the preset logic prevents WebUI, CLI, and Python API drift
+- the experiment conclusions already define the supported recipes precisely enough
+- tests can target one builder layer instead of duplicating recipe JSON assembly in many places
 
 Alternatives considered:
-- Always route every call through preset construction.
-  Rejected because it adds unnecessary surface area to legacy calls and risks subtle regressions.
 
-### 4. Productize supported presets across all current user-facing surfaces
+- embed preset JSON inline in each interface
+  rejected because it would fragment behavior and make review harder
 
-The rollout will update all surfaces that currently expose inference behavior:
+### 4. Roll out multi-reference support across current interfaces, but constrain the first UI/CLI surface
 
-- runtime Python API
-- `webui.py`
-- `indextts/cli.py`
-- `README.md`
+The WebUI and CLI will expose supported multi-reference usage through simple inputs, but the first rollout will prefer bounded ergonomics over full arbitrary recipe editing. Advanced `fusion_recipe` usage remains a Python-level path.
 
-WebUI will expose stable multi-reference controls directly. CLI will target `IndexTTS2` and expose repeatable reference flags plus preset selectors. README will document preset-driven usage first, with `fusion_recipe` documented as advanced usage.
+For the WebUI, the safest first rollout is additive controls that preserve the existing single-reference flow and allow optional multi-reference entry without replacing the current layout. For the CLI, the first rollout should prefer repeated reference arguments and preset flags rather than raw JSON input.
 
 Rationale:
-- Leaving one surface behind would create inconsistent user expectations and support burden.
-- The current CLI is explicitly outdated, so rollout is the right time to align it with the v2 runtime.
+
+- public interfaces need a stable supported path, not a thin shell over internal JSON structures
+- the WebUI must remain usable for current users
+- repeated arguments are more robust than shell-escaped JSON on Windows
 
 Alternatives considered:
-- Update Python API only.
-  Rejected because the user explicitly asked that existing features be updated together.
 
-### 5. Validate with lightweight unit seams plus one end-to-end smoke path
+- raw JSON recipe input in CLI and WebUI
+  rejected for first rollout because it is fragile and exposes internal complexity
+- WebUI-only rollout with no CLI update
+  rejected because the user explicitly required current functionality surfaces to stay aligned
+
+### 5. Add two validation layers: pure unit tests and one runtime smoke path
 
 Validation will be split into:
 
-- unit tests for preset building, recipe composition, and backward compatibility
-- surface tests for CLI/runtime invocation behavior
-- one end-to-end smoke path in `.venv` using the current project environment
+- unit tests for preset builders, compatibility rules, and interface argument normalization
+- an end-to-end smoke test path for `IndexTTS2` multi-reference execution using the project virtual environment and local assets
+
+The smoke path should remain small and targeted. It does not need to be a full model-quality benchmark, but it must prove the supported path executes and records metadata.
 
 Rationale:
-- Full real-model regression is expensive and brittle for every test, but rollout still needs at least one real execution path.
-- The repository already has seams for fake runtime coverage in `tests/test_speaker_fusion_experiment.py`, which can be extended or mirrored.
+
+- unit tests catch construction and compatibility regressions cheaply
+- a smoke path is necessary because the rollout crosses runtime, interfaces, and metadata output
 
 Alternatives considered:
-- Rely on unit tests only.
-  Rejected because interface integration is part of the rollout scope.
-- Make every test real-model.
-  Rejected because test cost and environment sensitivity would be too high.
+
+- unit tests only
+  rejected because the runtime path is too cross-cutting to trust without at least one integration path
+- full experimental rerun as rollout validation
+  rejected because the experiment phase is already complete and this would slow productization unnecessarily
 
 ## Risks / Trade-offs
 
-- [Preset API becomes ambiguous against `fusion_recipe`] -> Define precedence explicitly: raw `fusion_recipe` wins, preset args only build a recipe when `fusion_recipe` is absent.
-- [WebUI multi-file UX becomes fragile on Windows] -> Prefer a simple primary file plus explicit extra-reference path input or multi-file input with documented constraints; test the parsing path carefully.
-- [Legacy scripts depend on `spk_audio_prompt` as a list] -> Keep that shorthand working, but normalize it through the new preset builder and document it as compatibility behavior.
-- [Rollout accidentally promotes unstable branches] -> Restrict supported presets to experiment-backed stable levels and leave unstable paths behind `fusion_recipe` or experimental flows.
-- [CLI rewrite introduces behavior drift from WebUI/runtime] -> Make CLI call the same runtime convenience arguments instead of inventing a separate recipe parser.
+- [Convenience inputs accidentally change legacy single-reference behavior] -> keep `fusion_recipe=None` semantics intact and add explicit compatibility tests for unchanged single-reference calls.
+- [Preset builders drift from experiment conclusions] -> centralize preset construction in `indextts.fusion` and assert the selected levels, anchors, and weights in tests.
+- [WebUI multi-reference inputs make the UI confusing or brittle] -> add new controls as optional advanced inputs while leaving the current single-reference interaction intact.
+- [CLI design becomes hostile for Windows shells] -> prefer repeated path arguments and preset flags over JSON blobs.
+- [End-to-end tests become flaky because they depend on full model assets] -> keep the smoke test small, use existing local assets/checkpoints, and separate smoke execution from fast unit coverage.
+- [Untracked recovery state causes future compacted sessions to lose context] -> keep active mode, assumptions, blockers, and next step in tracked rollout documents and OpenSpec artifacts.
 
 ## Migration Plan
 
-1. Add preset-building helpers and argument normalization in `indextts/fusion.py`.
-2. Extend `IndexTTS2.infer()` and `infer_generator()` to accept rollout-facing convenience inputs and compose recipes from presets.
-3. Upgrade CLI to target `IndexTTS2` and reuse the new preset arguments.
-4. Update WebUI to expose multi-reference timbre and emotion controls using the supported presets.
-5. Add unit and end-to-end coverage in `.venv`.
-6. Update README and rollout recovery docs.
-7. Roll back by disabling preset construction and falling back to current single-reference behavior while leaving `fusion_recipe` support intact.
+1. Add preset builders and argument normalization for supported timbre and emotion multi-reference rollout behavior.
+2. Update `IndexTTS2` inference entrypoints to accept convenience inputs and translate them into the centralized preset builders.
+3. Update CLI and WebUI to expose the supported multi-reference path while preserving current single-reference use.
+4. Update README and Chinese documentation with supported examples and local development notes for the rollout.
+5. Add unit tests and an end-to-end smoke workflow in `.venv`.
+6. Run validation, capture review findings, and push the rollout branch.
+7. Roll back by disabling the convenience layer and falling back to legacy single-reference usage; raw `fusion_recipe` support remains available for controlled debugging if needed.
 
 ## Open Questions
 
-- Should the first WebUI iteration prefer multi-file upload, path-list text input, or both for extra references?
-- Should public custom weights be first-rollout scope, or should the supported rollout stay preset-only beyond equal weighting?
-- Does CLI need raw JSON `fusion_recipe` passthrough in the first rollout, or is preset-driven support enough for now?
+- Should the first rollout CLI expose the fallback preset selectors directly, or only the recommended default path unless a flag is set?
+- For the WebUI, is a small fixed number of optional extra audio inputs preferable to a free-form text path list for the first supported release?
+- Should the end-to-end smoke test live in `tests/` as an opt-in marker or as a dedicated root-level validation script invoked from the virtual environment?
