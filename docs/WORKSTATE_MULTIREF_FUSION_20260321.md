@@ -107,6 +107,32 @@ Result:
 
 - `13 passed`
 
+CPU-only smoke validation also completed under the resource cap:
+
+```bash
+env HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+OMP_NUM_THREADS=96 MKL_NUM_THREADS=96 OPENBLAS_NUM_THREADS=96 NUMEXPR_NUM_THREADS=96 \
+VECLIB_MAXIMUM_THREADS=96 RAYON_NUM_THREADS=96 \
+taskset -c 0-95 prlimit --as=51539607552 -- \
+.venv/bin/python -m indextts.cli "This is a CPU multi reference rollout smoke test." \
+  --voice data/open_source/cmu_arctic/ARCTIC/cmu_us_lnh_arctic/wav/arctic_a0457.wav \
+  --voice-ref data/open_source/cmu_arctic/ARCTIC/cmu_us_lnh_arctic/wav/arctic_a0526.wav \
+  --emotion data/open_source/cmu_arctic/ARCTIC/cmu_us_lnh_arctic/wav/arctic_b0285.wav \
+  --emotion-ref data/open_source/cmu_arctic/ARCTIC/cmu_us_lnh_arctic/wav/arctic_b0412.wav \
+  --speaker-fusion-mode default \
+  --emotion-fusion-mode default \
+  --device cpu \
+  --output_path artifacts/rollout_smoke/cli_multiref_smoke_cpu.wav \
+  --force
+```
+
+CPU smoke outcome:
+
+- generated `artifacts/rollout_smoke/cli_multiref_smoke_cpu.wav`
+- total inference time: `59.50s`
+- generated audio length: `4.11s`
+- RTF: `14.4780`
+
 ## Review Gate
 
 Before merge or handoff, confirm:
