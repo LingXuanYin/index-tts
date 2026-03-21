@@ -1,6 +1,6 @@
 # Multi-Reference Fusion Rollout Workstate
 
-Last updated: 2026-03-21
+Last updated: 2026-03-21 (rollout implementation complete)
 
 ## Current Objective
 
@@ -71,16 +71,18 @@ Reload this document first after any compact or interruption, then continue from
 ## Current Blockers
 
 - No hard technical blocker is active.
-- Remaining ambiguity to resolve during design artifact writing:
-  - whether public custom weights are first-rollout scope or only preset selection
-  - which WebUI input pattern is safest for Windows users: repeatable file inputs or newline-delimited file paths
-  - whether CLI exposes raw JSON recipe input in the first rollout or keeps presets only
+- Remaining non-blocking follow-up:
+  - the first WebUI rollout uses newline-delimited local file paths for extra references; this is documented and intentionally chosen over raw JSON editing
+  - CLI remains preset-based for the supported rollout path; advanced custom recipes stay Python-only
 
-## Pre-Coding Next Step
+## Current Status
 
-1. Finalize and commit team orchestration and workstate documents.
-2. Write and commit rollout OpenSpec proposal, design, specs, and tasks.
-3. Start implementation only after those artifacts are committed.
+- Rollout-facing preset builders are implemented in `indextts/fusion.py`.
+- `IndexTTS2.infer()` and `infer_generator()` accept supported multi-reference speaker and emotion arguments while preserving explicit `fusion_recipe` precedence.
+- CLI now runs `IndexTTS2` and exposes supported multi-reference flags.
+- WebUI exposes supported multi-reference timbre and emotion controls.
+- README, Chinese docs, and a root-level Windows local development note are updated.
+- Rollout unit and interface-smoke tests pass in `.venv`.
 
 ## Implementation Direction
 
@@ -93,6 +95,18 @@ Reload this document first after any compact or interruption, then continue from
   - add unit coverage for preset construction and backward compatibility
   - add one end-to-end smoke path under `.venv`
 
+## Validation Result
+
+Executed with `.venv/bin/python`:
+
+```bash
+.venv/bin/python -m pytest tests/test_fusion_rollout.py tests/test_cli_v2.py tests/test_speaker_fusion_experiment.py tests/test_flow_matching.py -q
+```
+
+Result:
+
+- `12 passed`
+
 ## Review Gate
 
 Before merge or handoff, confirm:
@@ -102,3 +116,7 @@ Before merge or handoff, confirm:
 - defaults match experiment conclusions
 - tests pass
 - documents can restore context without hidden chat state
+
+Current gate result:
+
+- all checks satisfied for this rollout iteration
