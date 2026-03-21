@@ -25,6 +25,15 @@ def read_manifest(path: Path) -> List[Dict[str, Any]]:
     return rows
 
 
+def safe_empty_cuda_cache() -> None:
+    if not torch.cuda.is_available():
+        return
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 def release_tts(tts: Any) -> None:
     if tts is not None:
         try:
@@ -34,7 +43,7 @@ def release_tts(tts: Any) -> None:
             pass
         del tts
     gc.collect()
-    torch.cuda.empty_cache()
+    safe_empty_cuda_cache()
 
 
 def build_tts(cfg_path: str, model_dir: str) -> IndexTTS2:
@@ -78,6 +87,7 @@ def main() -> None:
                     "metadata_output_path": metadata_output_path,
                 }
                 handle.write(json.dumps(result, ensure_ascii=False) + "\n")
+                handle.flush()
                 continue
 
             if tts is None or processed_since_reload >= args.reload_every:
@@ -128,7 +138,7 @@ def main() -> None:
             tts.reference_conditioning_cache.clear()
             tts.emotion_conditioning_cache.clear()
             gc.collect()
-            torch.cuda.empty_cache()
+            safe_empty_cuda_cache()
 
     release_tts(tts)
     print(results_path)

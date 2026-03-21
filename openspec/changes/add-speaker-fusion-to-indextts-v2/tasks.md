@@ -27,11 +27,13 @@
 ## 5. Verification And Rollout
 
 - [x] 5.1 Add focused tests for backward-compatible single-speaker inference, supported-tier fusion execution, cache-key isolation, and experiment manifest reproducibility.
-- [ ] 5.2 Run the first ten-batch open-source full-combination experiment to verify output generation, score collection, and report ranking.
-- [ ] 5.3 Document the supported and experimental fusion levels, the ten-batch open-source experiment workflow, and the selected default recommendation for future apply work.
+- [x] 5.2 Run the first ten-batch open-source full-combination experiment to verify output generation, score collection, and report ranking.
+- [x] 5.3 Document the supported and experimental fusion levels, the ten-batch open-source experiment workflow, and the selected default recommendation for future apply work.
 
 ## Current Handoff Status
 
 - Handoff document: `docs/SPEAKER_FUSION_HANDOFF_20260319.md`
-- 5.2 is still pending because the committed branch excludes local `data/` and `artifacts/`, so the ten-batch run results are not part of the pushed branch.
-- 5.3 is still pending because the supported and experimental implementation is documented, but the default recommended fusion scheme has not been selected yet.
+- 5.2 已在本地实验工作区完成，正式结果文件位于 `artifacts/speaker_fusion_timbre_screen_trim6/` 与 `artifacts/speaker_fusion_emotion_screen_trim6/`。
+- 5.3 已收敛出当前默认推荐:
+  - `音色多源参考`: `spk_cond_emb + speech_conditioning_latent`
+  - `情绪多源参考`: `emotion_tensor_anchor_a`
