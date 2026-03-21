@@ -15,7 +15,7 @@ Productize the selected no-training fusion scheme for IndexTTS v2 so the reposit
 
 Reload this document first after any compact or interruption, then continue from the referenced OpenSpec change and team charter.
 
-- Team charter: `docs/TEAM_MULTIREF_FUSION_ROLLOUT.md`
+- Team charter: `TEAM_MULTIREF_FUSION_ROLLOUT.md`
 - OpenSpec change: `openspec/changes/rollout-multiref-fusion-indextts-v2/`
 - Prior experiment handoff: `docs/SPEAKER_FUSION_HANDOFF_20260319.md`
 - Active branch: `multiref-fusion-rollout`
@@ -100,12 +100,45 @@ Reload this document first after any compact or interruption, then continue from
 Executed with `.venv/bin/python`:
 
 ```bash
-.venv/bin/python -m pytest tests/test_fusion_rollout.py tests/test_infer_v2_rollout_smoke.py tests/test_cli_v2.py tests/test_speaker_fusion_experiment.py tests/test_flow_matching.py -q
+.venv/bin/python -m pytest tests/test_fusion_rollout.py tests/test_cli_v2.py tests/test_infer_v2_rollout_smoke.py tests/test_speaker_fusion_experiment.py tests/test_flow_matching.py -q
 ```
 
 Result:
 
 - `13 passed`
+
+Real multi-reference runtime smoke also passed on `2026-03-21`:
+
+```bash
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 .venv/bin/python - <<'PY'
+from indextts.infer_v2 import IndexTTS2
+
+tts = IndexTTS2(
+    cfg_path="checkpoints/config.yaml",
+    model_dir="checkpoints",
+    use_fp16=False,
+    use_cuda_kernel=False,
+    device="cpu",
+)
+tts.infer(
+    spk_audio_prompt="data/open_source/cmu_arctic/ARCTIC/cmu_us_lnh_arctic/wav/arctic_a0457.wav",
+    speaker_references=["data/open_source/cmu_arctic/ARCTIC/cmu_us_lnh_arctic/wav/arctic_a0526.wav"],
+    speaker_fusion_mode="default",
+    emo_audio_prompt="data/open_source/cmu_arctic/ARCTIC/cmu_us_lnh_arctic/wav/arctic_b0285.wav",
+    emotion_references=["data/open_source/cmu_arctic/ARCTIC/cmu_us_lnh_arctic/wav/arctic_b0412.wav"],
+    emotion_fusion_mode="default",
+    text="This is a multi reference rollout smoke test.",
+    output_path="outputs/multiref_rollout_smoke.wav",
+    metadata_output_path="outputs/multiref_rollout_smoke.json",
+    return_metadata=True,
+)
+PY
+```
+
+Smoke artifacts:
+
+- audio: `outputs/multiref_rollout_smoke.wav`
+- metadata: `outputs/multiref_rollout_smoke.json`
 
 ## Review Gate
 
