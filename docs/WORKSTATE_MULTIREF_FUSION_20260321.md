@@ -107,39 +107,6 @@ Result:
 
 - `13 passed`
 
-Real multi-reference runtime smoke also passed on `2026-03-21`:
-
-```bash
-HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 .venv/bin/python - <<'PY'
-from indextts.infer_v2 import IndexTTS2
-
-tts = IndexTTS2(
-    cfg_path="checkpoints/config.yaml",
-    model_dir="checkpoints",
-    use_fp16=False,
-    use_cuda_kernel=False,
-    device="cpu",
-)
-tts.infer(
-    spk_audio_prompt="data/open_source/cmu_arctic/ARCTIC/cmu_us_lnh_arctic/wav/arctic_a0457.wav",
-    speaker_references=["data/open_source/cmu_arctic/ARCTIC/cmu_us_lnh_arctic/wav/arctic_a0526.wav"],
-    speaker_fusion_mode="default",
-    emo_audio_prompt="data/open_source/cmu_arctic/ARCTIC/cmu_us_lnh_arctic/wav/arctic_b0285.wav",
-    emotion_references=["data/open_source/cmu_arctic/ARCTIC/cmu_us_lnh_arctic/wav/arctic_b0412.wav"],
-    emotion_fusion_mode="default",
-    text="This is a multi reference rollout smoke test.",
-    output_path="outputs/multiref_rollout_smoke.wav",
-    metadata_output_path="outputs/multiref_rollout_smoke.json",
-    return_metadata=True,
-)
-PY
-```
-
-Smoke artifacts:
-
-- audio: `outputs/multiref_rollout_smoke.wav`
-- metadata: `outputs/multiref_rollout_smoke.json`
-
 ## Review Gate
 
 Before merge or handoff, confirm:
