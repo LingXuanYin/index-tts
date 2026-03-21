@@ -1,48 +1,44 @@
 ## ADDED Requirements
 
-### Requirement: IndexTTS2 SHALL expose supported multi-reference timbre presets
-The system SHALL allow callers to request multi-reference timbre fusion through rollout-facing convenience inputs instead of requiring a raw `fusion_recipe`. The supported timbre presets SHALL encode the experiment-selected default and fallback schemes.
+### Requirement: Rollout-facing multi-reference presets SHALL be available for timbre and emotion
+The system SHALL provide formal rollout-facing multi-reference support for `IndexTTS2` timbre and emotion fusion without requiring callers to author a full raw `fusion_recipe`.
 
-#### Scenario: Use recommended timbre preset
-- **WHEN** a caller provides two or more speaker references and selects the supported default timbre fusion mode
-- **THEN** the system builds a fusion recipe that enables `spk_cond_emb` and `speech_conditioning_latent` with symmetric weighting and symmetric anchoring
+#### Scenario: Build the supported timbre default
+- **WHEN** a caller requests supported multi-timbre fusion through the rollout-facing API
+- **THEN** the system constructs a supported recipe that uses `spk_cond_emb + speech_conditioning_latent` with symmetric `0.5 / 0.5` weighting by default
 
-#### Scenario: Use fallback timbre preset
-- **WHEN** a caller provides two or more speaker references and selects the supported fallback timbre fusion mode
-- **THEN** the system builds a fusion recipe that enables only `speech_conditioning_latent` with symmetric weighting and symmetric anchoring
+#### Scenario: Build the supported emotion default
+- **WHEN** a caller requests supported multi-emotion fusion through the rollout-facing API
+- **THEN** the system constructs a supported recipe that uses the `emotion_tensor_anchor_a` behavior with `0.5 / 0.5` weighting and `A` anchoring by default
 
-### Requirement: IndexTTS2 SHALL expose supported multi-reference emotion presets
-The system SHALL allow callers to request multi-reference emotion fusion through rollout-facing convenience inputs that are independent from timbre inputs. The supported emotion presets SHALL encode the experiment-selected default and fallback schemes.
+### Requirement: Timbre and emotion rollout inputs SHALL remain separated
+The system SHALL model timbre multi-reference control and emotion multi-reference control as separate axes in the rollout-facing interface.
 
-#### Scenario: Use recommended emotion preset
-- **WHEN** a caller provides two or more emotion references and selects the supported default emotion fusion mode
-- **THEN** the system builds an emotion-branch fusion configuration that uses weighted sum with anchor mode `A`
+#### Scenario: Timbre-only rollout request
+- **WHEN** a caller provides multi-reference timbre inputs but no multi-reference emotion inputs
+- **THEN** the system applies the timbre rollout preset without changing the legacy emotion path
 
-#### Scenario: Use fallback emotion preset
-- **WHEN** a caller provides two or more emotion references and selects the supported fallback emotion fusion mode
-- **THEN** the system builds an emotion-branch fusion configuration that uses weighted sum with anchor mode `symmetric`
+#### Scenario: Emotion-only rollout request
+- **WHEN** a caller provides multi-reference emotion inputs but no multi-reference timbre inputs
+- **THEN** the system applies the emotion rollout preset without changing the legacy timbre path
 
-### Requirement: Timbre and emotion multi-reference controls SHALL remain separate
-The system SHALL keep timbre-reference fusion and emotion-reference fusion as separate public controls so callers can vary them independently.
+### Requirement: Advanced `fusion_recipe` support SHALL remain available
+The system SHALL preserve explicit `fusion_recipe` support for advanced users and internal tooling.
 
-#### Scenario: Multi-reference timbre without multi-reference emotion
-- **WHEN** a caller provides multiple speaker references and no additional emotion references
-- **THEN** the system applies the requested timbre preset while preserving the existing emotion selection behavior
+#### Scenario: Expert override request
+- **WHEN** a caller passes an explicit `fusion_recipe`
+- **THEN** the system honors that explicit recipe instead of replacing it with a rollout preset
 
-#### Scenario: Multi-reference emotion without multi-reference timbre
-- **WHEN** a caller provides multiple emotion references and only one speaker reference
-- **THEN** the system applies the requested emotion preset without requiring timbre fusion
+### Requirement: Single-reference inference SHALL remain backward compatible
+The system SHALL preserve current single-reference `IndexTTS2` behavior when rollout-facing multi-reference inputs are not used.
 
-### Requirement: Raw fusion recipes SHALL override rollout presets
-The system SHALL preserve `fusion_recipe` as the expert interface and SHALL not overwrite it with rollout preset construction.
+#### Scenario: Legacy single-reference call
+- **WHEN** a caller uses the existing single-reference arguments and does not request rollout-facing multi-reference behavior
+- **THEN** the system follows the current single-reference inference path and returns a valid output without requiring new arguments
 
-#### Scenario: Raw recipe provided alongside rollout-facing preset inputs
-- **WHEN** a caller provides a non-null `fusion_recipe` together with multi-reference preset arguments
-- **THEN** the system uses the provided `fusion_recipe` as the effective recipe
+### Requirement: Unsupported unstable defaults SHALL not be promoted
+The system SHALL not promote `ref_mel`-based unstable routes into the supported rollout defaults.
 
-### Requirement: Legacy single-reference inference SHALL remain backward compatible
-The system SHALL preserve current IndexTTS v2 behavior when no multi-reference timbre or emotion inputs are provided.
-
-#### Scenario: Legacy inference call without rollout inputs
-- **WHEN** a caller uses the existing single-reference arguments only
-- **THEN** the system follows the current single-reference inference path and produces output without requiring preset construction
+#### Scenario: Supported rollout preset selection
+- **WHEN** the system constructs the supported rollout default or fallback presets
+- **THEN** those presets exclude `ref_mel` and `style + ref_mel` from the supported default path
