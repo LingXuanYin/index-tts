@@ -1,34 +1,33 @@
 ## ADDED Requirements
 
-### Requirement: WebUI SHALL expose supported multi-reference timbre and emotion controls
-The system SHALL expose the supported multi-reference rollout behavior in the WebUI without requiring users to author raw tensor recipes.
+### Requirement: Python inference entrypoints SHALL expose supported multi-reference usage
+The system SHALL expose rollout-facing multi-reference timbre and emotion usage through the public `IndexTTS2` inference entrypoints.
 
-#### Scenario: Configure multi-reference timbre from WebUI
-- **WHEN** a user supplies a primary timbre reference and one or more additional timbre references in the WebUI
-- **THEN** the WebUI passes the selected timbre preset and the full timbre reference list into the IndexTTS v2 runtime
+#### Scenario: Use supported timbre and emotion presets from Python
+- **WHEN** a Python caller invokes `IndexTTS2.infer()` or `infer_generator()` with rollout-facing multi-reference timbre and emotion inputs
+- **THEN** the system accepts those inputs and executes synthesis without requiring the caller to build raw recipe JSON manually
 
-#### Scenario: Configure multi-reference emotion from WebUI
-- **WHEN** a user selects emotion-reference mode and supplies one or more additional emotion references in the WebUI
-- **THEN** the WebUI passes the selected emotion preset and the full emotion reference list into the IndexTTS v2 runtime
+### Requirement: The CLI SHALL expose supported IndexTTS2 multi-reference fusion
+The system SHALL provide a supported CLI path for IndexTTS2 multi-reference timbre and emotion usage.
 
-### Requirement: CLI SHALL expose supported multi-reference timbre and emotion controls
-The system SHALL provide a CLI path for IndexTTS v2 that supports multi-reference timbre and emotion fusion through rollout-facing flags.
+#### Scenario: Run multi-reference synthesis from CLI
+- **WHEN** a user invokes the CLI with supported multi-reference timbre and or emotion reference arguments
+- **THEN** the CLI executes the IndexTTS2 path and forwards the corresponding supported rollout preset into inference
 
-#### Scenario: Use CLI with multiple timbre references
-- **WHEN** a user invokes the CLI with a primary timbre reference and one or more additional timbre-reference flags
-- **THEN** the CLI runs IndexTTS v2 with the selected timbre fusion preset
+### Requirement: The WebUI SHALL expose optional multi-reference timbre and emotion controls
+The system SHALL expose supported multi-reference timbre and emotion controls in the WebUI while keeping the current single-reference flow usable.
 
-#### Scenario: Use CLI with multiple emotion references
-- **WHEN** a user invokes the CLI with one or more emotion-reference flags
-- **THEN** the CLI runs IndexTTS v2 with the selected emotion fusion preset while preserving the requested timbre configuration
+#### Scenario: Use WebUI without multi-reference inputs
+- **WHEN** a WebUI user keeps the new multi-reference controls empty
+- **THEN** the WebUI continues to synthesize with the existing single-reference behavior
 
-### Requirement: Project documentation SHALL describe supported multi-reference rollout behavior
-The system SHALL document the supported multi-reference timbre and emotion workflows in the repository documentation.
+#### Scenario: Use WebUI with supported multi-reference inputs
+- **WHEN** a WebUI user provides supported extra timbre and or emotion references
+- **THEN** the WebUI synthesizes through the supported rollout preset path
 
-#### Scenario: Read supported rollout docs
-- **WHEN** a user reads the main project documentation for IndexTTS v2 inference
-- **THEN** the documentation includes supported multi-reference usage for Python, WebUI, and CLI together with the selected recommended presets
+### Requirement: Project documentation SHALL describe the supported rollout path
+The system SHALL document the supported multi-reference timbre and emotion workflow in the main project documentation.
 
-#### Scenario: Read advanced recipe docs
-- **WHEN** a user needs expert-level tensor control beyond the supported presets
-- **THEN** the documentation distinguishes advanced `fusion_recipe` usage from the supported rollout path
+#### Scenario: Read the supported multi-reference docs
+- **WHEN** a user reads the README or corresponding localized documentation
+- **THEN** the user can find the supported default multi-reference workflow, fallback behavior, compatibility notes, and local development expectations
