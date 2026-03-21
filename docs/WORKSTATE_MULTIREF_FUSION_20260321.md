@@ -100,12 +100,12 @@ Reload this document first after any compact or interruption, then continue from
 Executed with `.venv/bin/python`:
 
 ```bash
-.venv/bin/python -m pytest tests/test_fusion_rollout.py tests/test_cli_v2.py tests/test_infer_v2_rollout_smoke.py tests/test_speaker_fusion_experiment.py tests/test_flow_matching.py -q
+.venv/bin/python -m pytest tests/test_fusion_rollout.py tests/test_cli_v2.py tests/test_infer_v2_rollout_smoke.py tests/test_speaker_fusion_experiment.py -q
 ```
 
 Result:
 
-- `13 passed`
+- `12 passed`
 
 Real multi-reference runtime smoke also passed on `2026-03-21`:
 

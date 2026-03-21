@@ -42,7 +42,7 @@ uv run indextts "hello world" --voice path\to\voice.wav --output_path outputs\he
 Run tests:
 
 ```powershell
-.venv\Scripts\python.exe -m pytest tests/test_fusion_rollout.py tests/test_cli_v2.py tests/test_infer_v2_rollout_smoke.py tests/test_speaker_fusion_experiment.py
+.venv\Scripts\python.exe -m pytest tests/test_fusion_rollout.py tests/test_cli_v2.py tests/test_infer_v2_rollout_smoke.py tests/test_speaker_fusion_experiment.py tests/test_flow_matching.py -q
 ```
 
 ## Recovery
