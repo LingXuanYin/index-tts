@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import os
 from dataclasses import dataclass
-from typing import Callable, MutableMapping, Sequence, TypeVar
+from typing import Callable, Hashable, MutableMapping, Sequence, TypeVar
 
 import torch
 
@@ -95,6 +96,37 @@ def get_or_create_cached(cache: MutableMapping[str, T], key: str, factory: Calla
 
     cache[key] = factory()
     return cache[key]
+
+
+def resolve_unique_results(
+    keys: Sequence[Hashable],
+    factory: Callable[[Hashable], T],
+    max_workers: int = 1,
+) -> dict[Hashable, T]:
+    ordered_unique_keys = []
+    seen_keys = set()
+    for key in keys:
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        ordered_unique_keys.append(key)
+
+    if not ordered_unique_keys:
+        return {}
+
+    if max_workers <= 1 or len(ordered_unique_keys) == 1:
+        return {key: factory(key) for key in ordered_unique_keys}
+
+    worker_count = min(max_workers, len(ordered_unique_keys))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_by_key = {
+            key: executor.submit(factory, key)
+            for key in ordered_unique_keys
+        }
+        return {
+            key: future_by_key[key].result()
+            for key in ordered_unique_keys
+        }
 
 
 def _coerce_reference_paths(reference_paths, label: str) -> list[str]:

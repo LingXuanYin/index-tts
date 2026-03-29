@@ -40,6 +40,7 @@ from indextts.reference_conditioning import (
     merge_variable_length_tensors,
     merge_weighted_vectors,
     normalize_reference_inputs,
+    resolve_unique_results,
 )
 from indextts.emotion_reference_selection import (
     expand_audio_like_emotion_rows,
@@ -216,6 +217,7 @@ class IndexTTS2:
         # 缓存参考音频：
         self.cache_spk_refs = {}
         self.cache_emo_refs = {}
+        self.reference_feature_workers = self._default_reference_feature_workers()
 
         # 进度引用显示（可选）
         self.gr_progress = None
@@ -373,6 +375,26 @@ class IndexTTS2:
     def _normalize_reference_inputs(self, refs, weights=None, label="reference"):
         return normalize_reference_inputs(refs, weights, label=label)
 
+    def _default_reference_feature_workers(self):
+        configured_workers = os.environ.get("INDEXTTS_REF_FEATURE_WORKERS")
+        if configured_workers is not None:
+            try:
+                return max(1, int(configured_workers))
+            except ValueError:
+                pass
+
+        cpu_count = os.cpu_count() or 1
+        if isinstance(self.device, str) and self.device.startswith("cuda"):
+            return min(2, cpu_count)
+        return min(4, cpu_count)
+
+    def _resolve_unique_reference_results(self, paths, factory):
+        return resolve_unique_results(
+            paths,
+            factory,
+            max_workers=self.reference_feature_workers,
+        )
+
     def _merge_weighted_vectors(self, tensors, weights):
         return merge_weighted_vectors(tensors, weights)
 
@@ -468,7 +490,11 @@ class IndexTTS2:
         return get_or_create_cached(self.cache_emo_refs, cache_key, factory)
 
     def _fuse_speaker_references(self, references, verbose=False):
-        speaker_features = [self._get_speaker_reference_features(ref.path, verbose=verbose) for ref in references]
+        speaker_feature_map = self._resolve_unique_reference_results(
+            [ref.path for ref in references],
+            lambda path: self._get_speaker_reference_features(path, verbose=verbose),
+        )
+        speaker_features = [speaker_feature_map[ref.path] for ref in references]
         weights = [ref.weight for ref in references]
         return {
             "spk_cond_emb": self._merge_weighted_sequence_tensors(
@@ -489,7 +515,11 @@ class IndexTTS2:
         }
 
     def _fuse_emotion_references(self, references, verbose=False):
-        emotion_features = [self._get_emotion_reference_features(ref.path, verbose=verbose) for ref in references]
+        emotion_feature_map = self._resolve_unique_reference_results(
+            [ref.path for ref in references],
+            lambda path: self._get_emotion_reference_features(path, verbose=verbose),
+        )
+        emotion_features = [emotion_feature_map[ref.path] for ref in references]
         weights = [ref.weight for ref in references]
         return self._merge_weighted_sequence_tensors(
             [feature["emo_cond_emb"] for feature in emotion_features], weights, length_dim=1
@@ -518,6 +548,24 @@ class IndexTTS2:
     def _expand_audio_like_emotion_rows(self, emotion_rows, speaker_references):
         return expand_audio_like_emotion_rows(emotion_rows, speaker_references)
 
+    def _prefetch_structured_emotion_features(self, emotion_rows, speaker_references, verbose=False):
+        feature_paths = []
+        for row in emotion_rows:
+            row_type = row["type"]
+            if row_type == "speaker":
+                _, speaker_ref = self._resolve_speaker_reference_for_emotion_row(
+                    row,
+                    speaker_references,
+                )
+                feature_paths.append(speaker_ref.path)
+            elif row_type == "audio":
+                feature_paths.append(row["path"])
+
+        return self._resolve_unique_reference_results(
+            feature_paths,
+            lambda path: self._get_emotion_reference_features(path, verbose=verbose),
+        )
+
     def _resolve_structured_emotion_conditioning(
         self,
         emotion_rows,
@@ -539,6 +587,11 @@ class IndexTTS2:
         merged_vectors = []
         weights = []
         speaker_emovecs = {}
+        emotion_feature_map = self._prefetch_structured_emotion_features(
+            emotion_rows,
+            speaker_references,
+            verbose=verbose,
+        )
         for row in emotion_rows:
             row_type = row["type"]
             if row_type == "speaker":
@@ -548,21 +601,28 @@ class IndexTTS2:
                 )
                 speaker_emovec = speaker_emovecs.get(speaker_ref.path)
                 if speaker_emovec is None:
-                    emotion_cond_emb = self._get_emotion_reference_features(
-                        speaker_ref.path,
-                        verbose=verbose,
-                    )["emo_cond_emb"]
+                    emotion_cond_emb = emotion_feature_map[speaker_ref.path]["emo_cond_emb"]
                     speaker_cond_lengths = torch.tensor(
                         [self._sequence_length(emotion_cond_emb)],
                         device=self.device,
                     )
-                    speaker_emovec = self.gpt.get_emovec(emotion_cond_emb, speaker_cond_lengths)
+                    with torch.amp.autocast(
+                        emotion_cond_emb.device.type,
+                        enabled=self.dtype is not None,
+                        dtype=self.dtype,
+                    ):
+                        speaker_emovec = self.gpt.get_emovec(emotion_cond_emb, speaker_cond_lengths)
                     speaker_emovecs[speaker_ref.path] = speaker_emovec
                 merged_vectors.append(speaker_emovec)
             elif row_type == "audio":
-                emo_cond_emb = self._get_emotion_reference_features(row["path"], verbose=verbose)["emo_cond_emb"]
+                emo_cond_emb = emotion_feature_map[row["path"]]["emo_cond_emb"]
                 emo_cond_lengths = torch.tensor([self._sequence_length(emo_cond_emb)], device=self.device)
-                merged_vectors.append(self.gpt.get_emovec(emo_cond_emb, emo_cond_lengths))
+                with torch.amp.autocast(
+                    emo_cond_emb.device.type,
+                    enabled=self.dtype is not None,
+                    dtype=self.dtype,
+                ):
+                    merged_vectors.append(self.gpt.get_emovec(emo_cond_emb, emo_cond_lengths))
             elif row_type == "vector":
                 merged_vectors.append(
                     self._build_emovec_from_control_vector(

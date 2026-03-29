@@ -1,4 +1,6 @@
 import unittest
+from concurrent.futures import Future
+from unittest import mock
 
 import torch
 
@@ -7,6 +9,7 @@ from indextts.reference_conditioning import (
     merge_variable_length_tensors,
     merge_weighted_vectors,
     normalize_reference_inputs,
+    resolve_unique_results,
 )
 
 
@@ -80,6 +83,43 @@ class MultiReferenceConditioningTests(unittest.TestCase):
 
         self.assertIs(first, second)
         self.assertEqual(calls["count"], 1)
+
+    def test_resolve_unique_results_deduplicates_keys(self):
+        calls = []
+
+        def factory(key):
+            calls.append(key)
+            return key.upper()
+
+        results = resolve_unique_results(["speaker_a", "speaker_b", "speaker_a"], factory, max_workers=4)
+
+        self.assertEqual(results, {"speaker_a": "SPEAKER_A", "speaker_b": "SPEAKER_B"})
+        self.assertEqual(calls, ["speaker_a", "speaker_b"])
+
+    def test_resolve_unique_results_uses_executor_when_parallelism_is_enabled(self):
+        submitted = []
+
+        class FakeExecutor:
+            def __init__(self, max_workers):
+                self.max_workers = max_workers
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                return False
+
+            def submit(self, fn, key):
+                submitted.append((self.max_workers, key))
+                future = Future()
+                future.set_result(fn(key))
+                return future
+
+        with mock.patch("indextts.reference_conditioning.ThreadPoolExecutor", FakeExecutor):
+            results = resolve_unique_results(["a", "b"], lambda key: key * 2, max_workers=8)
+
+        self.assertEqual(results, {"a": "aa", "b": "bb"})
+        self.assertEqual(submitted, [(2, "a"), (2, "b")])
 
 
 if __name__ == "__main__":
