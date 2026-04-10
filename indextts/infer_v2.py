@@ -223,6 +223,16 @@ class IndexTTS2:
         self.gr_progress = None
         self.model_version = self.cfg.version if hasattr(self.cfg, "version") else None
 
+        # VC 推理懒加载占位变量（Trained VC, add-voice-conversion-v2）
+        # 实际加载在首次调用 infer_vc_trained() 时触发（_ensure_vc_loaded）
+        self.vc_model = None            # MyModel (VC finetuned checkpoint)
+        self.vc_content_encoder = None  # ContentEncoder (HuBERT-soft)
+        self.vc_f0_encoder = None       # F0Encoder (RMVPE wrapper)
+        self.vc_kmeans = None           # KMeansQuantizer (codebook)
+        self.vc_config = None           # VC config dict (embedded in checkpoint)
+        self.vc_f0_strategy = None      # str, read from checkpoint metadata
+        print(">> VC model will be loaded on first use (lazy-loading)")
+
     @torch.no_grad()
     def get_emb(self, input_features, attention_mask):
         vq_emb = self.semantic_model(

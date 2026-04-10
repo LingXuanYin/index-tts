@@ -333,6 +333,83 @@ tts.infer(spk_audio_prompt='examples/voice_12.wav', text=text, output_path="gen.
 > 之前你做DE5很好，所以这一次也DEI3做DE2很好才XING2，如果这次目标完成得不错的话，我们就直接打DI1去银行取钱。
 > ```
 
+### 训练版语音转换（Trained Voice Conversion）
+
+#### 概述
+
+训练版语音转换（Trained VC）是一个说话人转换流水线，复用 IndexTTS2 的 s2mel DiT 解码器，
+将一个说话人的语音转换为另一个说话人的音色，**无需文本转录**。
+与 TTS 不同，内容信号来自 HuBERT-soft 内容特征而非 GPT 生成的语义 token，
+因此整个 GPT 阶段被完全绕过。
+
+#### 架构
+
+```
+源音频 → HuBERT-soft 内容编码器 → K-means 量化（200 类）
+                                              ↓ content (B, T, 256)
+源音频 → RMVPE F0 提取 → F0 策略 → 对齐后 F0 (B, T)
+                                              ↓ (B, T, 512) via length_regulator
+目标说话人参考 → HuBERT-soft → K-means → prompt content (B, T_ref, 256)
+目标说话人参考 → 梅尔频谱图 (22050/80/256) → ref_mel
+目标说话人参考 → CAMPPlus → 风格向量（192维）
+                                              ↓
+                    s2mel DiT（微调，f0_condition=True）+ BigVGAN
+                                              ↓
+                                      转换后波形
+```
+
+#### 训练流程
+
+VC 模型通过**两阶段微调** `checkpoints/s2mel.pth` 预训练权重获得：
+
+1. **数据准备** — 下载 AISHELL-3 / LibriTTS-clean-100，执行 manifest 生成、
+   离线预处理（内容特征 + F0 + 梅尔频谱图 + 风格向量），以及 K-means 训练。
+2. **第一阶段**（3 万步）— 仅训练新初始化的层（`content_in_proj`、`f0_embedding`、
+   `f0_mask`、`cond_x_merge_linear`），冻结 DiT 主体。
+3. **第二阶段**（最多 20 万步）— 解冻完整 DiT 主体，使用 10 倍于第一阶段的较低学习率
+   微调，同时继续以第一阶段的学习率更新重置层。
+
+完整的分步 recipe（数据集下载命令、预处理 CLI、K-means 训练、单卡/多卡启动命令）见
+[`indextts/vc_train/README.md`](../indextts/vc_train/README.md)。
+
+#### 推理
+
+**Python API：**
+
+```python
+from indextts.infer_v2 import IndexTTS2
+from indextts.infer_vc_trained import infer_vc_trained
+
+tts = IndexTTS2(cfg_path="checkpoints/config.yaml", model_dir="checkpoints")
+
+# 基本用法 — F0 轮廓经过全局偏移，使源 F0 中值对齐到目标说话人
+infer_vc_trained(
+    tts,
+    source_audio="path/to/source.wav",
+    speaker_refs="path/to/target_speaker.wav",
+    output_path="converted.wav",
+    f0_strategy="source_plus_shift",   # 或：source_contour / target_median / manual
+    diffusion_steps=25,
+)
+```
+
+**WebUI：** 运行 `uv run webui.py`，打开 **"Trained VC"** 标签页。
+
+#### 已知限制
+
+- **不支持歌声转换** — 当前模型面向语音；歌声转换为 v2 目标。
+- **首次运行自动下载** — HuBERT-soft（约 95 MB）将在首次调用时从 `bshall/hubert` 自动下载。
+- **需要 VC checkpoint** — 需要在 `checkpoints/vc/trained_vc.pth` 存放训练好的 VC 检查点
+  （或通过 `checkpoint_path=...` 参数显式指定路径）。
+- **需要 RMVPE checkpoint** — 从
+  [lj1995/VoiceConversionWebUI](https://huggingface.co/lj1995/VoiceConversionWebUI)
+  下载 `rmvpe.pt`，放置于 `checkpoints/rmvpe/model.pt`。
+- **评测依赖** — 自动评测工具（`indextts/vc_train/eval.py`）依赖可选包：`speechbrain`
+  （说话人相似度）、`openai/whisper-large-v3`（字符错误率）和 `UTMOSv2`（MOS 分）。
+  这些包**不是**推理所必需的。
+
+---
+
 ### 旧版IndexTTS1使用指南
 
 如果需要使用旧的IndexTTS1.5模型，可以import旧模块：

@@ -7,7 +7,7 @@ import numpy as np
 from indextts.s2mel.dac.nn.quantize import VectorQuantize
 
 # f0_bin = 256
-f0_max = 1100.0
+f0_max = 2000.0
 f0_min = 50.0
 f0_mel_min = 1127 * np.log(1 + f0_min / 700)
 f0_mel_max = 1127 * np.log(1 + f0_max / 700)

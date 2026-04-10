@@ -473,6 +473,77 @@ def prepare_generation():
     )
 
 
+# ─────────────────────────────────────── Trained VC callback (Group 6) ───────
+
+
+def gen_single_vc_trained(
+    vct_source_audio,
+    vct_speaker_ref,
+    vct_f0_strategy,
+    vct_manual_semitones,
+    vct_cfg,
+    vct_steps,
+    vct_checkpoint_path,
+    progress=gr.Progress(),
+):
+    """Gradio callback for Trained VC tab.
+
+    Validates inputs, calls infer_vc_trained, handles exceptions.
+    VC model is NOT pre-loaded at startup — lazy-loading happens here on first call.
+    """
+    from indextts.infer_vc_trained import infer_vc_trained
+
+    try:
+        # ── Input validation ──────────────────────────────────────────────────
+        if vct_source_audio is None:
+            raise ValueError(i18n("请上传源音频文件"))
+        if vct_speaker_ref is None:
+            raise ValueError(i18n("请上传目标说话人参考音频"))
+        if not vct_checkpoint_path or not vct_checkpoint_path.strip():
+            raise ValueError(i18n("请指定 VC checkpoint 路径"))
+        if not os.path.exists(vct_checkpoint_path.strip()):
+            raise FileNotFoundError(
+                i18n("VC checkpoint 文件不存在: ") + vct_checkpoint_path.strip()
+            )
+
+        output_path = os.path.join("outputs", f"vc_{int(time.time())}.wav")
+
+        tts.gr_progress = progress
+        result = infer_vc_trained(
+            tts,
+            source_audio=vct_source_audio,
+            speaker_refs=vct_speaker_ref,
+            output_path=output_path,
+            checkpoint_path=vct_checkpoint_path.strip(),
+            f0_strategy=vct_f0_strategy,
+            manual_semitones=float(vct_manual_semitones),
+            diffusion_steps=int(vct_steps),
+            inference_cfg_rate=float(vct_cfg),
+            verbose=cmd_args.verbose,
+        )
+
+        # infer_vc_trained returns None when output_path is set
+        if result is None and os.path.exists(output_path):
+            return (
+                gr.update(value=output_path, visible=True),
+                gr.update(value="", visible=False),
+            )
+        raise RuntimeError(i18n("VC 生成完成但未产生音频文件"))
+
+    except Exception as exc:
+        error_message = f"{type(exc).__name__}: {exc}\n{i18n('详见')} {WEBUI_LOG_PATH}"
+        print("WebUI VC generation failed:")
+        traceback.print_exc()
+        with open(WEBUI_LOG_PATH, "a", encoding="utf-8") as handle:
+            handle.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] [VC] {error_message}\n")
+            handle.write(traceback.format_exc())
+            handle.write("\n")
+        return (
+            gr.update(value=None, visible=False),
+            gr.update(value=create_error_message(error_message), visible=True),
+        )
+
+
 def on_input_text_change(text, max_text_tokens_per_segment):
     if text:
         text_tokens_list = tts.tokenizer.tokenize(text)
@@ -763,6 +834,100 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                             key="segments_preview",
                             wrap=True,
                         )
+
+    # ─────────────────────────────── Trained VC tab (Group 6) ───────────────
+    with gr.Tab(i18n("训练版语音转换 (Trained VC)")):
+        gr.Markdown(
+            i18n(
+                "使用训练好的 VC checkpoint 进行语音转换。"
+                "首次点击生成时自动加载 VC 模型（懒加载）。"
+            )
+        )
+        with gr.Row():
+            vct_source_audio = gr.Audio(
+                label=i18n("源音频（待转换）"),
+                sources=["upload", "microphone"],
+                type="filepath",
+            )
+            vct_speaker_ref = gr.Audio(
+                label=i18n("目标说话人参考音频"),
+                sources=["upload", "microphone"],
+                type="filepath",
+            )
+        with gr.Row():
+            vct_output_audio = gr.Audio(label=i18n("转换结果"), visible=True)
+        vct_gen_button = gr.Button(
+            i18n("开始转换"),
+            variant="primary",
+            interactive=True,
+        )
+        vct_generation_status = gr.HTML(value="", visible=False)
+        with gr.Accordion(i18n("高级参数"), open=False):
+            with gr.Row():
+                vct_f0_strategy = gr.Dropdown(
+                    label=i18n("F0 策略"),
+                    choices=[
+                        ("source_contour", "source_contour"),
+                        ("source_plus_shift", "source_plus_shift"),
+                        ("target_median", "target_median"),
+                        ("manual", "manual"),
+                    ],
+                    value="source_plus_shift",
+                    info=i18n(
+                        "source_contour: 保留源音频音高轮廓；"
+                        "source_plus_shift: 源轮廓 + 目标中位数对齐（推荐）；"
+                        "target_median: 使用目标说话人中位音高；"
+                        "manual: 手动半音偏移"
+                    ),
+                )
+                vct_manual_semitones = gr.Slider(
+                    label=i18n("手动半音偏移（仅 manual 策略生效）"),
+                    minimum=-12,
+                    maximum=12,
+                    step=0.5,
+                    value=0,
+                )
+            with gr.Row():
+                vct_cfg = gr.Slider(
+                    label=i18n("CFG Rate"),
+                    minimum=0.0,
+                    maximum=4.0,
+                    step=0.1,
+                    value=0.7,
+                    info=i18n("classifier-free guidance 强度"),
+                )
+                vct_steps = gr.Slider(
+                    label=i18n("扩散步数"),
+                    minimum=5,
+                    maximum=80,
+                    step=1,
+                    value=25,
+                )
+            vct_checkpoint_path = gr.Textbox(
+                label=i18n("VC Checkpoint 路径"),
+                value="checkpoints/vc/trained_vc.pth",
+                placeholder="checkpoints/vc/trained_vc.pth",
+                info=i18n("训练好的 VC checkpoint 文件路径"),
+            )
+
+        vct_gen_button.click(
+            lambda: (gr.update(value=None, visible=False), gr.update(value=create_info_message(i18n("正在转换，请稍候...")), visible=True)),
+            inputs=[],
+            outputs=[vct_output_audio, vct_generation_status],
+        ).then(
+            gen_single_vc_trained,
+            inputs=[
+                vct_source_audio,
+                vct_speaker_ref,
+                vct_f0_strategy,
+                vct_manual_semitones,
+                vct_cfg,
+                vct_steps,
+                vct_checkpoint_path,
+            ],
+            outputs=[vct_output_audio, vct_generation_status],
+        )
+    # ─────────────────────────────── end Trained VC tab ─────────────────────
 
     speaker_active_inputs = [row["active"] for row in speaker_rows]
     speaker_weight_inputs = [row["weight"] for row in speaker_rows]

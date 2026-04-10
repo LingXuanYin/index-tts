@@ -30,3 +30,4 @@ desktop.ini
 !/checkpoints/*.yaml
 /logs/
 /outputs/
+/data/

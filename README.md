@@ -412,6 +412,87 @@ tts.infer(spk_audio_prompt='examples/voice_12.wav', text=text, output_path="gen.
 > 之前你做DE5很好，所以这一次也DEI3做DE2很好才XING2，如果这次目标完成得不错的话，我们就直接打DI1去银行取钱。
 > ```
 
+### Trained Voice Conversion
+
+#### Overview
+
+Trained Voice Conversion (Trained VC) is a speaker-conversion pipeline that re-uses the
+IndexTTS2 s2mel DiT decoder to transform speech from one speaker into another, **without
+any text transcript**.  Unlike TTS, the content signal comes from HuBERT-soft content
+features rather than GPT-generated semantic tokens, so the GPT stage is bypassed entirely.
+
+#### Architecture
+
+```
+source audio → HuBERT-soft content encoder → k-means quantization (200 clusters)
+                                                        ↓ content (B, T, 256)
+source audio → RMVPE F0 extractor → F0 strategy → aligned F0 (B, T)
+                                                        ↓ (B, T, 512) via length_regulator
+speaker ref  → HuBERT-soft → k-means → prompt content (B, T_ref, 256)
+speaker ref  → mel spectrogram (22050/80/256) → ref_mel
+speaker ref  → CAMPPlus → style vector (192-d)
+                                                        ↓
+                             s2mel DiT (finetuned, f0_condition=True) + BigVGAN
+                                                        ↓
+                                              converted waveform
+```
+
+#### Training
+
+The VC model is obtained by finetuning the pretrained `checkpoints/s2mel.pth` weights
+in **two phases**:
+
+1. **Data preparation** — download AISHELL-3 / LibriTTS-clean-100, run manifest
+   generation, offline preprocessing (content + F0 + mel + style), and k-means training.
+2. **Phase 1** (30 k steps) — train only the newly-initialised layers
+   (`content_in_proj`, `f0_embedding`, `f0_mask`, `cond_x_merge_linear`) while freezing
+   the DiT body.
+3. **Phase 2** (up to 200 k steps) — unfreeze the full DiT body with a 10x lower
+   learning rate, continuing to update reset layers at the Phase-1 rate.
+
+For the full step-by-step recipe (dataset download commands, preprocessing CLI,
+k-means training, single-GPU and multi-GPU launch commands), see
+[`indextts/vc_train/README.md`](indextts/vc_train/README.md).
+
+#### Inference
+
+**Python API:**
+
+```python
+from indextts.infer_v2 import IndexTTS2
+from indextts.infer_vc_trained import infer_vc_trained
+
+tts = IndexTTS2(cfg_path="checkpoints/config.yaml", model_dir="checkpoints")
+
+# Basic usage — F0 contour is shifted to match the target speaker's median pitch
+infer_vc_trained(
+    tts,
+    source_audio="path/to/source.wav",
+    speaker_refs="path/to/target_speaker.wav",
+    output_path="converted.wav",
+    f0_strategy="source_plus_shift",   # or: source_contour / target_median / manual
+    diffusion_steps=25,
+)
+```
+
+**WebUI:** launch `uv run webui.py` and open the **"Trained VC"** tab.
+
+#### Known Limitations
+
+- **No singing VC** — the current model targets speech; singing voice conversion is a v2 goal.
+- **First-run download** — HuBERT-soft (~95 MB) is downloaded automatically from
+  `bshall/hubert` on the first call.
+- **VC checkpoint required** — a trained VC checkpoint must exist at
+  `checkpoints/vc/trained_vc.pth` (or pass `checkpoint_path=...` explicitly).
+- **RMVPE checkpoint required** — download `rmvpe.pt` from
+  [lj1995/VoiceConversionWebUI](https://huggingface.co/lj1995/VoiceConversionWebUI)
+  and place it at `checkpoints/rmvpe/model.pt`.
+- **Evaluation dependencies** — the automatic eval harness (`indextts/vc_train/eval.py`)
+  requires optional packages: `speechbrain` (speaker similarity), `openai/whisper-large-v3`
+  (CER), and `UTMOSv2` (MOS). These are **not** required for inference.
+
+---
+
 ### Legacy: IndexTTS1 User Guide
 
 You can also use our previous IndexTTS1 model by importing a different module:

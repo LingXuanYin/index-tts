@@ -1,0 +1,185 @@
+# VC Training Configuration (add-voice-conversion-v2)
+# This is a standalone config for VC finetuning. Load it explicitly when running
+# vc_train/train.py:  --config indextts/vc_train/config_vc.yaml
+# It is NOT merged with checkpoints/config.yaml at runtime — all s2mel fields
+# needed for VC must be explicitly present here.
+
+# -----------------------------------------------------------------------
+# S2Mel preprocessing spec (must match BigVGAN decoder expectation)
+# -----------------------------------------------------------------------
+s2mel:
+  preprocess_params:
+    sr: 22050
+    spect_params:
+      n_fft: 1024
+      win_length: 1024
+      hop_length: 256
+      n_mels: 80
+      fmin: 0
+      fmax: "None"
+
+  dit_type: "DiT"
+  reg_loss_type: "l1"
+  style_encoder:
+    dim: 192
+
+  # -----------------------------------------------------------------------
+  # Length Regulator — key VC overrides
+  # -----------------------------------------------------------------------
+  length_regulator:
+    channels: 512
+    is_discrete: false
+    in_channels: 256            # HuBERT-soft output dim (was 1024 in TTS)
+    content_codebook_size: 2048
+    sampling_ratios: [1, 1, 1, 1]
+    vector_quantize: false
+    n_codebooks: 1
+    quantizer_dropout: 0.0
+    f0_condition: true          # Enable F0 conditioning branch
+    n_f0_bins: 256              # VC uses 256 bins (TTS used 512)
+
+  # -----------------------------------------------------------------------
+  # WaveNet final layer (required by DiT when final_layer_type = "wavenet")
+  # -----------------------------------------------------------------------
+  wavenet:
+    hidden_dim: 512
+    num_layers: 8
+    kernel_size: 5
+    dilation_rate: 1
+    p_dropout: 0.2
+    style_condition: true
+
+  # -----------------------------------------------------------------------
+  # DiT — F0 conditioning enabled; no gpt_layer
+  # -----------------------------------------------------------------------
+  DiT:
+    hidden_dim: 512
+    num_heads: 8
+    depth: 13
+    class_dropout_prob: 0.1
+    block_size: 8192
+    in_channels: 80
+    style_condition: true
+    final_layer_type: "wavenet"
+    target: "mel"
+    content_dim: 512
+    content_codebook_size: 1024
+    content_type: "discrete"
+    f0_condition: true          # Enable F0 conditioning in DiT path
+    n_f0_bins: 256
+    content_codebooks: 1
+    is_causal: false
+    long_skip_connection: true
+    zero_prompt_speech_token: false
+    time_as_token: false
+    style_as_token: false
+    uvit_skip_connection: true
+
+# -----------------------------------------------------------------------
+# Content Encoder (HuBERT-soft)
+# -----------------------------------------------------------------------
+content_encoder:
+  type: "hubert_soft"            # "hubert_soft" | "contentvec" (future)
+  # torch.hub.load("bshall/hubert:main", "hubert_soft") — no HF token needed
+  hub_repo: "bshall/hubert"
+  hub_model: "hubert_soft"
+  output_dim: 256
+  frame_rate_hz: 50             # 16kHz / 320 = 50 Hz
+  device: null                  # null → inferred from accelerate / CLI
+
+# -----------------------------------------------------------------------
+# K-means Quantizer (design D3)
+# -----------------------------------------------------------------------
+kmeans:
+  enabled: true                  # false = bypass (debug / ablation)
+  n_clusters: 200
+  dim: 256                       # must match content_encoder.output_dim
+  codebook_path: "checkpoints/vc/kmeans_200.pt"
+
+# -----------------------------------------------------------------------
+# F0 Extractor (design D4, D6)
+# -----------------------------------------------------------------------
+f0:
+  extractor: "rmvpe"
+  model_path: "checkpoints/rmvpe/model.pt"
+  frame_rate_hz: 100             # RMVPE native; decimated to 50 Hz in preprocessing
+  voiced_threshold: 0.03
+  # Default F0 strategy written into checkpoint metadata
+  # One of: source_contour / source_plus_shift / target_median / manual
+  strategy: "source_plus_shift"
+
+# -----------------------------------------------------------------------
+# Datasets (design D8)
+# -----------------------------------------------------------------------
+datasets:
+  - name: aishell3
+    path: data/vc/aishell3
+    language: zh
+    weight: 1.0
+  - name: libritts_clean_100
+    path: data/vc/libritts_clean_100
+    language: en
+    weight: 1.0
+  # Uncomment to include WenetSpeech4TTS premium subset
+  # - name: wenetspeech4tts_premium
+  #   path: data/vc/wenetspeech4tts_premium
+  #   language: zh
+  #   weight: 2.0
+
+# Speaker-level split ratios (must sum to ≤ 1.0)
+split:
+  train: 0.90
+  val: 0.05
+  test: 0.05
+
+# -----------------------------------------------------------------------
+# Training (design D7)
+# -----------------------------------------------------------------------
+training:
+  # Two-phase finetune (phase 1 = reset layers only; phase 2 = full DiT)
+  phase1_steps: 30000
+  phase2_steps: 200000           # total steps including phase1
+  # Fallback: set --single_phase flag on CLI to bypass phase separation
+
+  # Learning rates
+  reset_lr: 1.0e-4               # Phase 1 (all layers); Phase 2 (reset layers)
+  finetune_lr: 1.0e-5            # Phase 2 (DiT finetune layers, 10x smaller)
+
+  # Optional: reset DiT.cond_projection as well (experiment flag D7)
+  reset_cond_projection: false
+
+  # s2mel.pth path for initialisation
+  pretrained_s2mel: "checkpoints/s2mel.pth"
+
+  # LR schedule
+  warmup_steps: 2000
+  scheduler: "cosine"            # "cosine" | "constant"
+
+  # Logging / checkpointing
+  log_interval: 100
+  eval_interval: 5000
+  save_interval: 5000
+  checkpoint_dir: "checkpoints/vc"
+  tensorboard_dir: "checkpoints/vc/tb_logs"
+
+  # Phase 1 convergence guard: if loss not decreasing by 5k steps, trigger fallback
+  phase1_convergence_check_steps: 5000
+  phase1_convergence_threshold: 0.20   # 20% drop required (design D7)
+
+# -----------------------------------------------------------------------
+# Eval harness (design D10)
+# -----------------------------------------------------------------------
+eval:
+  secs:
+    ecapa_source: "speechbrain/spkrec-ecapa-voxceleb"
+    ecapa_savedir: "pretrained_models/spkrec-ecapa-voxceleb"
+  cer:
+    whisper_model: "openai/whisper-large-v3"
+    char_level: true
+  f0_rmse:
+    unit: "cents"                # 1200 * log2(pred/target)
+  utmos:
+    enabled: true                # set false if UTMOSv2 install fails
+    try_except_isolated: true
+  output_json: "checkpoints/vc/eval_report.json"
+  test_split_only: true          # only evaluate on held-out test speakers
