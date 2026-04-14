@@ -411,11 +411,17 @@ while global_step < TOTAL_STEPS:
             ema_path = f"checkpoints/vc/final_ema_step{global_step+1}.pth"
             torch.save({"model_state_dict": ema_state, "global_step": global_step + 1}, ema_path)
             print(f"  >> Saved {ckpt_path} + {ema_path}", flush=True)
-            # Auto-cleanup: keep last 3
+            # Auto-cleanup: keep last 3 (sort by step NUMBER, not alphabetically!)
+            import re as _re
+            def _step_num(path):
+                m = _re.search(r'step(\d+)', path)
+                return int(m.group(1)) if m else 0
             for prefix in ["final_step", "final_ema_step"]:
-                old = sorted(glob.glob(f"checkpoints/vc/{prefix}*.pth"))
+                old = sorted(glob.glob(f"checkpoints/vc/{prefix}*.pth"), key=_step_num)
                 while len(old) > 3:
-                    os.remove(old.pop(0))
+                    removed = old.pop(0)
+                    os.remove(removed)
+                    print(f"    Cleanup: deleted {os.path.basename(removed)}", flush=True)
 
         global_step += 1
 

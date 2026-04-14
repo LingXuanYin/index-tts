@@ -306,11 +306,16 @@ def train(args):
                 print(f"  >> Saved {ckpt_path}" + (f" + {ema_path}" if ema_params else ""))
 
                 # Auto-cleanup: keep only last 3 checkpoints to prevent disk full
-                import glob as _g
+                import re as _re
+                def _step_num(path):
+                    m = _re.search(r'step(\d+)', path)
+                    return int(m.group(1)) if m else 0
                 for prefix in ["v2_step", "v2_ema_step"]:
-                    old_ckpts = sorted(_g.glob(f"checkpoints/vc/{prefix}*.pth"))
+                    old_ckpts = sorted(glob.glob(f"checkpoints/vc/{prefix}*.pth"), key=_step_num)
                     while len(old_ckpts) > 3:
-                        os.remove(old_ckpts.pop(0))
+                        removed = old_ckpts.pop(0)
+                        os.remove(removed)
+                        print(f"    Cleanup: deleted {os.path.basename(removed)}")
 
             global_step += 1
 
