@@ -4,10 +4,26 @@ Fixes: P0 (real CAMPPlus style), P1 (loss clamp), P2 (proper HP search).
 Runs: HP search → full training → inference → verify.
 ALL errors CRASH LOUD.
 """
-import torch, os, sys, yaml, numpy as np, json, glob, time, math, itertools, copy
+import torch, os, sys, yaml, numpy as np, json, glob, time, math, itertools, copy, argparse
 import librosa, torchaudio
 sys.path.insert(0, ".")
 from munch import Munch
+from torch.optim.lr_scheduler import LambdaLR
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--aishell3-dir", default="/root/autodl-tmp/train/wav")
+    p.add_argument("--output-dir", default="/root/autodl-tmp/index-tts/data/vc/aishell3")
+    p.add_argument("--campplus-path", default="checkpoints/campplus/campplus_cn_common.bin")
+    p.add_argument("--steps", type=int, default=300000)
+    p.add_argument("--batch-size", type=int, default=10)
+    p.add_argument("--max-duration", type=float, default=6.0)
+    p.add_argument("--resume", default=None)
+    p.add_argument("--skip-preprocess", action="store_true", help="Skip style regen if already done")
+    p.add_argument("--skip-hp-search", action="store_true", help="Skip HP search, use defaults")
+    return p.parse_args()
+
+ARGS = parse_args()
 
 def FATAL(msg):
     print(f"\n{'='*60}\nFATAL: {msg}\n{'='*60}")
@@ -15,136 +31,220 @@ def FATAL(msg):
 
 print("=" * 70)
 print("FIX AND TRAIN: Full Pipeline")
+print(f"  aishell3: {ARGS.aishell3_dir}")
+print(f"  output:   {ARGS.output_dir}")
+print(f"  campplus: {ARGS.campplus_path}")
+print(f"  steps:    {ARGS.steps}, batch: {ARGS.batch_size}")
 print("=" * 70)
 
 # ============================================================
-# STEP 1: Regenerate .style.npy with real CAMPPlus
+# STEP 1: Full preprocessing (content + f0 + mel + style)
 # ============================================================
-print("\n=== STEP 1: Regenerate style with CAMPPlus ===")
+if ARGS.skip_preprocess:
+    print("\n=== STEP 1: SKIPPED (--skip-preprocess) ===")
+else:
+    print("\n=== STEP 1: Full Preprocessing ===")
 
-CAMPPLUS_PATH = "/root/autodl-tmp/index-tts/checkpoints/campplus/campplus_cn_common.bin"
-if not os.path.exists(CAMPPLUS_PATH):
-    FATAL(f"CAMPPlus checkpoint not found: {CAMPPLUS_PATH}")
+    CAMPPLUS_PATH = ARGS.campplus_path
+    if not os.path.exists(CAMPPLUS_PATH):
+        FATAL(f"CAMPPlus checkpoint not found: {CAMPPLUS_PATH}")
 
-from indextts.s2mel.modules.campplus.DTDNN import CAMPPlus
-campplus = CAMPPlus(feat_dim=80, embedding_size=192)
-campplus_state = torch.load(CAMPPLUS_PATH, map_location="cpu", weights_only=True)
-campplus.load_state_dict(campplus_state)
-campplus = campplus.cuda().eval()
-print("CAMPPlus loaded.")
+    # Load models
+    from indextts.s2mel.modules.campplus.DTDNN import CAMPPlus
+    campplus = CAMPPlus(feat_dim=80, embedding_size=192)
+    campplus.load_state_dict(torch.load(CAMPPLUS_PATH, map_location="cpu", weights_only=True))
+    campplus = campplus.cuda().eval()
+    print("  CAMPPlus loaded.")
 
-# Mel function (same as s2mel training)
-from indextts.s2mel.modules.audio import mel_spectrogram
-mel_fn = lambda x: mel_spectrogram(x, n_fft=1024, num_mels=80, sampling_rate=22050,
-                                     hop_size=256, win_size=1024, fmin=0, fmax=None)
+    print("  Loading HuBERT-soft...")
+    hubert = torch.hub.load("bshall/hubert:main", "hubert_soft", trust_repo=True)
+    hubert = hubert.cuda().eval()
+    hubert.requires_grad_(False)
+    print("  HuBERT-soft loaded.")
 
-prep = "data/vc/aishell3/preprocessed"
-content_files = sorted(glob.glob(os.path.join(prep, "*.content.npy")))
-print(f"Regenerating style for {len(content_files)} utterances...")
+    from indextts.s2mel.modules.audio import mel_spectrogram
+    mel_fn = lambda x: mel_spectrogram(x, n_fft=1024, num_mels=80, sampling_rate=22050,
+                                         hop_size=256, win_size=1024, fmin=0, fmax=None)
 
-# Read manifest for audio paths
-manifest = {}
-with open("data/vc/aishell3/manifest.jsonl") as f:
-    for line in f:
-        e = json.loads(line)
-        stem = os.path.splitext(os.path.basename(e["audio_path"]))[0]
-        manifest[stem] = e["audio_path"]
+    prep = os.path.join(ARGS.output_dir, "preprocessed")
+    os.makedirs(prep, exist_ok=True)
 
-regen_count = 0
-regen_errors = 0
-t0 = time.time()
+    # Scan wav files
+    wav_files = sorted(glob.glob(os.path.join(ARGS.aishell3_dir, "**", "*.wav"), recursive=True))
+    if not wav_files:
+        FATAL(f"No wav files found in {ARGS.aishell3_dir}")
+    print(f"  Found {len(wav_files)} wav files")
 
-for i, cf in enumerate(content_files):
-    stem_name = os.path.basename(cf).replace(".content.npy", "")
-    style_path = os.path.join(prep, stem_name + ".style.npy")
-    audio_path = manifest.get(stem_name)
-    if audio_path is None:
-        continue
+    manifest_entries = []
+    skipped = {"short": 0, "long": 0, "low_voiced": 0, "error": 0}
+    done = 0
+    t0 = time.time()
 
-    try:
-        audio_16k, _ = librosa.load(audio_path, sr=16000)
-        audio_16k_t = torch.from_numpy(audio_16k).unsqueeze(0).cuda()
-        # CAMPPlus input: kaldi fbank (NOT mel_spectrogram!) — same as infer_v2.py:457-464
-        feat = torchaudio.compliance.kaldi.fbank(
-            audio_16k_t, num_mel_bins=80, dither=0, sample_frequency=16000)
-        feat = feat - feat.mean(dim=0, keepdim=True)  # mean normalization
-        with torch.no_grad():
-            style = campplus(feat.unsqueeze(0))  # (1, 192)
-        np.save(style_path, style.cpu().numpy().squeeze(0).astype(np.float32))
-        regen_count += 1
-    except Exception as e:
-        regen_errors += 1
-        if regen_errors <= 3:
-            print(f"  Error on {stem_name}: {e}")
+    for i, wav_path in enumerate(wav_files):
+        speaker_id = os.path.basename(os.path.dirname(wav_path))
+        stem = os.path.splitext(os.path.basename(wav_path))[0]
+        feature_base = os.path.join(prep, stem)
 
-    if (i + 1) % 5000 == 0:
-        elapsed = time.time() - t0
-        rate = (i + 1) / elapsed
-        eta = (len(content_files) - i - 1) / rate
-        print(f"  [{i+1}/{len(content_files)}] {regen_count} done, {regen_errors} errors, {rate:.0f}/s, ETA {eta/60:.0f}min")
+        # Skip if ALL features already exist
+        if all(os.path.exists(feature_base + ext)
+               for ext in [".content.npy", ".f0.npy", ".mel.npy", ".style.npy"]):
+            # Still add to manifest
+            try:
+                dur = librosa.get_duration(filename=wav_path)
+                if 1.0 <= dur <= ARGS.max_duration:
+                    manifest_entries.append({
+                        "audio_path": wav_path, "speaker_id": speaker_id,
+                        "language": "zh", "duration_s": round(dur, 2), "text": stem,
+                    })
+                    done += 1
+            except Exception:
+                pass
+            continue
 
-elapsed = time.time() - t0
-print(f"Style regeneration: {regen_count} done, {regen_errors} errors, {elapsed/60:.1f}min")
+        try:
+            audio_16k, _ = librosa.load(wav_path, sr=16000)
+            duration = len(audio_16k) / 16000.0
+            if duration < 1.0:
+                skipped["short"] += 1
+                continue
+            if duration > ARGS.max_duration:
+                skipped["long"] += 1
+                continue
 
-# Verify a few
-for cf in content_files[:5]:
-    stem_name = os.path.basename(cf).replace(".content.npy", "")
-    s = np.load(os.path.join(prep, stem_name + ".style.npy"))
-    if s.shape != (192,):
-        FATAL(f"Style shape wrong: {s.shape}")
-    if np.isnan(s).any():
-        FATAL(f"Style has NaN: {stem_name}")
-    # Real CAMPPlus embeddings should NOT look like random noise
-    # They should have structure (not all near-zero mean/unit std like randn)
-    if abs(s.std() - 1.0) < 0.1:
-        print(f"  WARNING: {stem_name} style looks suspiciously like randn (std={s.std():.3f})")
-    else:
-        pass  # Good — real embeddings have non-unit std
+            audio_16k_t = torch.from_numpy(audio_16k).unsqueeze(0)
 
-print("Style verification passed.\n")
-del campplus
-torch.cuda.empty_cache()
+            # 1. HuBERT-soft content
+            with torch.no_grad():
+                content = hubert.units(audio_16k_t.unsqueeze(0).cuda()).cpu().numpy().squeeze(0)
+            np.save(feature_base + ".content.npy", content.astype(np.float32))
 
-# Also regenerate mini_real styles
-print("Regenerating mini_real styles...")
-campplus2 = CAMPPlus(feat_dim=80, embedding_size=192)
-campplus2.load_state_dict(torch.load(CAMPPLUS_PATH, map_location="cpu", weights_only=True))
-campplus2 = campplus2.cuda().eval()
+            # 2. F0 via librosa.pyin (~50 Hz)
+            f0, _, _ = librosa.pyin(audio_16k, fmin=65, fmax=2000, sr=16000, hop_length=16000 // 50)
+            f0 = np.nan_to_num(f0, nan=0.0).astype(np.float32)
+            target_len = content.shape[0]
+            if len(f0) > target_len:
+                f0 = f0[:target_len]
+            elif len(f0) < target_len:
+                f0 = np.pad(f0, (0, target_len - len(f0)))
+            if np.mean(f0 > 0) < 0.1:
+                skipped["low_voiced"] += 1
+                continue
+            np.save(feature_base + ".f0.npy", f0)
 
-mini_prep = "data/vc/mini_real/preprocessed"
-mini_content = sorted(glob.glob(os.path.join(mini_prep, "*.content.npy")))
-mini_manifest = {}
-with open("data/vc/mini_real/manifest.jsonl") as f:
-    for line in f:
-        e = json.loads(line)
-        stem = os.path.splitext(os.path.basename(e["audio_path"]))[0]
-        mini_manifest[stem] = e["audio_path"]
+            # 3. Mel (log mel, same as s2mel training)
+            audio_22k = librosa.resample(audio_16k, orig_sr=16000, target_sr=22050)
+            mel = mel_fn(torch.from_numpy(audio_22k).unsqueeze(0).cuda()).cpu().squeeze(0).numpy()
+            np.save(feature_base + ".mel.npy", mel.astype(np.float32))
 
-for cf in mini_content:
-    stem_name = os.path.basename(cf).replace(".content.npy", "")
-    audio_path = mini_manifest.get(stem_name)
-    if audio_path is None:
-        continue
-    try:
-        audio_16k, _ = librosa.load(audio_path, sr=16000)
-        audio_16k_t = torch.from_numpy(audio_16k).unsqueeze(0).cuda()
-        feat = torchaudio.compliance.kaldi.fbank(
-            audio_16k_t, num_mel_bins=80, dither=0, sample_frequency=16000)
-        feat = feat - feat.mean(dim=0, keepdim=True)
-        with torch.no_grad():
-            style = campplus2(feat.unsqueeze(0))
-        np.save(os.path.join(mini_prep, stem_name + ".style.npy"),
-                style.cpu().numpy().squeeze(0).astype(np.float32))
-    except Exception:
-        pass
-del campplus2
-torch.cuda.empty_cache()
-print("Mini_real styles done.\n")
+            # 4. Style (real CAMPPlus via kaldi fbank)
+            feat = torchaudio.compliance.kaldi.fbank(
+                audio_16k_t.cuda(), num_mel_bins=80, dither=0, sample_frequency=16000)
+            feat = feat - feat.mean(dim=0, keepdim=True)
+            with torch.no_grad():
+                style = campplus(feat.unsqueeze(0)).cpu().numpy().squeeze(0)
+            np.save(feature_base + ".style.npy", style.astype(np.float32))
+
+            manifest_entries.append({
+                "audio_path": wav_path, "speaker_id": speaker_id,
+                "language": "zh", "duration_s": round(duration, 2), "text": stem,
+            })
+            done += 1
+
+        except Exception as e:
+            skipped["error"] += 1
+            if skipped["error"] <= 5:
+                print(f"  Error: {wav_path}: {e}")
+
+        if (i + 1) % 1000 == 0:
+            elapsed = time.time() - t0
+            rate = (i + 1) / elapsed
+            eta = (len(wav_files) - i - 1) / rate
+            print(f"  [{i+1}/{len(wav_files)}] done={done} skipped={sum(skipped.values())} "
+                  f"{rate:.0f}/s ETA {eta/60:.0f}min", flush=True)
+
+    # Save manifest
+    manifest_path = os.path.join(ARGS.output_dir, "manifest.jsonl")
+    with open(manifest_path, "w") as f:
+        for m in manifest_entries:
+            f.write(json.dumps(m, ensure_ascii=False) + "\n")
+    n_spk = len(set(m["speaker_id"] for m in manifest_entries))
+    elapsed = time.time() - t0
+    print(f"\n  Preprocessing done: {done} valid, {skipped} skipped, {n_spk} speakers, {elapsed/60:.1f}min")
+
+    # K-means
+    print("  Training k-means (200 clusters)...")
+    from indextts.vc.kmeans_quantizer import KMeansQuantizer
+    content_files_all = sorted(glob.glob(os.path.join(prep, "*.content.npy")))
+    frames = []
+    for cf in content_files_all:
+        frames.append(np.load(cf))
+        if sum(len(x) for x in frames) > 500000:
+            break
+    frames = np.concatenate(frames)
+    if len(frames) > 500000:
+        idx = np.random.choice(len(frames), 500000, replace=False)
+        frames = frames[idx]
+    kq = KMeansQuantizer(n_clusters=200)
+    kq.train(frames)
+    kq.save(os.path.join(ARGS.output_dir, "kmeans_codebook.pt"))
+    print(f"  K-means: {len(frames)} frames → {os.path.join(ARGS.output_dir, 'kmeans_codebook.pt')}")
+
+    # Create mini_real subset for HP search (first 10 per speaker, max 5 speakers)
+    mini_dir = os.path.join(ARGS.output_dir, "mini_real")
+    mini_prep_dir = os.path.join(mini_dir, "preprocessed")
+    os.makedirs(mini_prep_dir, exist_ok=True)
+    spk_seen = {}
+    mini_entries = []
+    for m in manifest_entries:
+        sid = m["speaker_id"]
+        spk_seen.setdefault(sid, 0)
+        if spk_seen[sid] >= 10:
+            continue
+        if len(spk_seen) > 5 and sid not in spk_seen:
+            continue
+        spk_seen[sid] += 1
+        stem = os.path.splitext(os.path.basename(m["audio_path"]))[0]
+        # Symlink features
+        for ext in [".content.npy", ".f0.npy", ".mel.npy", ".style.npy"]:
+            src = os.path.join(prep, stem + ext)
+            dst = os.path.join(mini_prep_dir, stem + ext)
+            if os.path.exists(src) and not os.path.exists(dst):
+                try:
+                    os.symlink(src, dst)
+                except OSError:
+                    import shutil
+                    shutil.copy2(src, dst)
+        mini_entries.append(m)
+    with open(os.path.join(mini_dir, "manifest.jsonl"), "w") as f:
+        for m in mini_entries:
+            f.write(json.dumps(m, ensure_ascii=False) + "\n")
+    # Mini k-means
+    mini_kq = KMeansQuantizer(n_clusters=20)
+    mini_frames = []
+    for m in mini_entries[:20]:
+        stem = os.path.splitext(os.path.basename(m["audio_path"]))[0]
+        cf = os.path.join(mini_prep_dir, stem + ".content.npy")
+        if os.path.exists(cf):
+            mini_frames.append(np.load(cf))
+    if mini_frames:
+        mini_kq.train(np.concatenate(mini_frames))
+        mini_kq.save(os.path.join(mini_dir, "kmeans_codebook.pt"))
+    print(f"  Mini dataset: {len(mini_entries)} entries for HP search")
+
+    # Cleanup GPU
+    del campplus, hubert
+    torch.cuda.empty_cache()
+    print("  Preprocessing complete.\n")
 
 # ============================================================
 # STEP 2: HP Search (2000 steps, real style, loss clamp)
 # ============================================================
-print("=== STEP 2: HP Search (2000 steps, batch=10, real style) ===")
+if ARGS.skip_hp_search:
+    BEST_LR = 1e-4
+    BEST_WARMUP = 1000
+    print(f"=== STEP 2: SKIPPED (--skip-hp-search), using lr={BEST_LR}, warmup={BEST_WARMUP} ===")
+else:
+    print("=== STEP 2: HP Search (2000 steps, batch=10, real style) ===")
 
 with open("checkpoints/config.yaml") as f:
     BASE = Munch.fromDict(yaml.safe_load(f))
@@ -161,101 +261,102 @@ from indextts.vc_train.manifest import read_jsonl
 from indextts.vc.kmeans_quantizer import KMeansQuantizer
 from torch.utils.tensorboard import SummaryWriter
 
-# Mini dataset with real style
-kmeans_mini = KMeansQuantizer(n_clusters=20)
-kmeans_mini.load("data/vc/mini_real/kmeans_codebook.pt")
-entries_mini = []
-for m in read_jsonl("data/vc/mini_real/manifest.jsonl"):
-    if m.duration_s > 6.0:
-        continue
-    stem = os.path.splitext(os.path.basename(m.audio_path))[0]
-    e = m.to_dict()
-    e["feature_base"] = os.path.join("data/vc/mini_real/preprocessed", stem)
-    entries_mini.append(e)
+if not ARGS.skip_hp_search:
+    # Mini dataset with real style
+    kmeans_mini = KMeansQuantizer(n_clusters=20)
+    kmeans_mini.load(os.path.join(ARGS.output_dir, "mini_real", "kmeans_codebook.pt"))
+    entries_mini = []
+    for m in read_jsonl(os.path.join(ARGS.output_dir, "mini_real", "manifest.jsonl")):
+        if m.duration_s > 6.0:
+            continue
+        stem = os.path.splitext(os.path.basename(m.audio_path))[0]
+        e = m.to_dict()
+        e["feature_base"] = os.path.join(ARGS.output_dir, "mini_real", "preprocessed", stem)
+        entries_mini.append(e)
 
-ds_mini = VCDataset(entries=entries_mini, f0_strategy="source_contour")
-print(f"HP search dataset: {len(ds_mini)} utterances")
+    ds_mini = VCDataset(entries=entries_mini, f0_strategy="source_contour")
+    print(f"HP search dataset: {len(ds_mini)} utterances")
 
-LRS = [5e-5, 1e-4, 2e-4, 5e-4, 1e-3]
-WARMUPS = [500, 1000]
-HP_STEPS = 2000
-BATCH = min(10, len(ds_mini))
-hp_results = []
+    LRS = [5e-5, 1e-4, 2e-4, 5e-4, 1e-3]
+    WARMUPS = [500, 1000]
+    HP_STEPS = 2000
+    BATCH = min(10, len(ds_mini))
+    hp_results = []
 
-for lr, warmup in itertools.product(LRS, WARMUPS):
-    name = f"lr{lr:.0e}_wu{warmup}"
-    print(f"  [{name}] ...", end="", flush=True)
+    for lr, warmup in itertools.product(LRS, WARMUPS):
+        name = f"lr{lr:.0e}_wu{warmup}"
+        print(f"  [{name}] ...", end="", flush=True)
 
-    model, rp, fp = build_vc_model(copy.deepcopy(BASE))
-    model = model.cuda().train()
-    for g in rp + fp:
-        for p in g["params"]:
-            p.requires_grad_(True)
+        model, rp, fp = build_vc_model(copy.deepcopy(BASE))
+        model = model.cuda().train()
+        for g in rp + fp:
+            for p in g["params"]:
+                p.requires_grad_(True)
 
-    optimizer = torch.optim.AdamW(rp + fp, lr=lr, weight_decay=1e-2)
-    def make_sched(wu):
-        def fn(step):
-            if step < wu:
-                return step / max(1, wu)
-            return 0.5 * (1 + math.cos(math.pi * (step - wu) / max(1, 300000 - wu)))
-        return fn
-    from torch.optim.lr_scheduler import LambdaLR
-    scheduler = LambdaLR(optimizer, lr_lambda=make_sched(warmup))
+        optimizer = torch.optim.AdamW(rp + fp, lr=lr, weight_decay=1e-2)
+        def make_sched(wu):
+            def fn(step):
+                if step < wu:
+                    return step / max(1, wu)
+                return 0.5 * (1 + math.cos(math.pi * (step - wu) / max(1, 300000 - wu)))
+            return fn
+        from torch.optim.lr_scheduler import LambdaLR
+        scheduler = LambdaLR(optimizer, lr_lambda=make_sched(warmup))
 
-    loader = torch.utils.data.DataLoader(
-        ds_mini, batch_size=BATCH, shuffle=True, collate_fn=vc_collate_fn, drop_last=True)
+        loader = torch.utils.data.DataLoader(
+            ds_mini, batch_size=BATCH, shuffle=True, collate_fn=vc_collate_fn, drop_last=True, num_workers=0)
 
-    losses = []
-    nan_count = 0
-    step = 0
-    for epoch in range(HP_STEPS):
-        for batch in loader:
+        losses = []
+        nan_count = 0
+        step = 0
+        for epoch in range(HP_STEPS):
+            for batch in loader:
+                if step >= HP_STEPS:
+                    break
+                batch = {k: v.cuda() if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    loss = vc_train_step(model, batch, device="cuda")
+                # LOSS CLAMP (P1 fix)
+                loss = torch.clamp(loss, max=10.0)
+                if not torch.isfinite(loss):
+                    nan_count += 1
+                    optimizer.zero_grad()
+                    step += 1
+                    continue
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+                losses.append(loss.item())
+                step += 1
             if step >= HP_STEPS:
                 break
-            batch = {k: v.cuda() if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                loss = vc_train_step(model, batch, device="cuda")
-            # LOSS CLAMP (P1 fix)
-            loss = torch.clamp(loss, max=10.0)
-            if not torch.isfinite(loss):
-                nan_count += 1
-                optimizer.zero_grad()
-                step += 1
-                continue
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
-            losses.append(loss.item())
-            step += 1
-        if step >= HP_STEPS:
-            break
 
-    avg = np.mean(losses[-500:]) if len(losses) >= 500 else np.mean(losses)
-    print(f" avg_last500={avg:.4f} nan={nan_count}")
-    hp_results.append({"name": name, "lr": lr, "warmup": warmup, "avg": avg, "nan": nan_count})
-    del model, optimizer
-    torch.cuda.empty_cache()
+        avg = np.mean(losses[-500:]) if len(losses) >= 500 else np.mean(losses)
+        print(f" avg_last500={avg:.4f} nan={nan_count}")
+        hp_results.append({"name": name, "lr": lr, "warmup": warmup, "avg": avg, "nan": nan_count})
+        del model, optimizer
+        torch.cuda.empty_cache()
 
-hp_results.sort(key=lambda r: r["avg"])
-print("\nHP Search Results:")
-for i, r in enumerate(hp_results):
-    mark = " <-- BEST" if i == 0 else ""
-    print(f"  {r['name']:20s} avg={r['avg']:.4f} nan={r['nan']}{mark}")
+    hp_results.sort(key=lambda r: r["avg"])
+    print("\nHP Search Results:")
+    for i, r in enumerate(hp_results):
+        mark = " <-- BEST" if i == 0 else ""
+        print(f"  {r['name']:20s} avg={r['avg']:.4f} nan={r['nan']}{mark}")
 
-best_hp = hp_results[0]
-BEST_LR = best_hp["lr"]
-BEST_WARMUP = best_hp["warmup"]
-print(f"\nBest: lr={BEST_LR}, warmup={BEST_WARMUP}")
+    best_hp = hp_results[0]
+    BEST_LR = best_hp["lr"]
+    BEST_WARMUP = best_hp["warmup"]
+    print(f"\nBest: lr={BEST_LR}, warmup={BEST_WARMUP}")
 
-if best_hp["nan"] > HP_STEPS * 0.01:
-    FATAL(f"Best HP config has {best_hp['nan']} NaN ({100*best_hp['nan']/HP_STEPS:.1f}%) — training will be unstable")
+    if best_hp["nan"] > HP_STEPS * 0.01:
+        FATAL(f"Best HP config has {best_hp['nan']} NaN ({100*best_hp['nan']/HP_STEPS:.1f}%) — training will be unstable")
 
 # ============================================================
 # STEP 3: Full Training (300k steps, real style, loss clamp)
 # ============================================================
-print(f"\n=== STEP 3: Full Training (300k, lr={BEST_LR}, warmup={BEST_WARMUP}, batch=10) ===")
+print(f"\n=== STEP 3: Full Training ({ARGS.steps//1000}k, lr={BEST_LR}, warmup={BEST_WARMUP}, batch={ARGS.batch_size}) ===")
 
 from accelerate import Accelerator
 accelerator = Accelerator(mixed_precision="bf16")
@@ -268,9 +369,9 @@ ema_decay = 0.9999
 
 # Full dataset with real style
 kmeans_full = KMeansQuantizer(n_clusters=200)
-kmeans_full.load("data/vc/aishell3/kmeans_codebook.pt")
+kmeans_full.load(os.path.join(ARGS.output_dir, "kmeans_codebook.pt"))
 
-entries_raw = read_jsonl("data/vc/aishell3/manifest.jsonl")
+entries_raw = read_jsonl(os.path.join(ARGS.output_dir, "manifest.jsonl"))
 spk_count = {}
 for m in entries_raw:
     spk_count[m.speaker_id] = spk_count.get(m.speaker_id, 0) + 1
@@ -280,14 +381,14 @@ for m in entries_raw:
         continue
     stem = os.path.splitext(os.path.basename(m.audio_path))[0]
     e = m.to_dict()
-    e["feature_base"] = os.path.join("data/vc/aishell3/preprocessed", stem)
+    e["feature_base"] = os.path.join(ARGS.output_dir, "preprocessed", stem)
     entries.append(e)
 n_spk = len(set(e["speaker_id"] for e in entries))
 print(f"Dataset: {len(entries)} utterances, {n_spk} speakers")
 
 ds = VCDataset(entries=entries, f0_strategy="source_contour")
 loader = torch.utils.data.DataLoader(
-    ds, batch_size=10, shuffle=True, collate_fn=vc_collate_fn, drop_last=True, num_workers=4)
+    ds, batch_size=ARGS.batch_size, shuffle=True, collate_fn=vc_collate_fn, drop_last=True, num_workers=0)
 
 # Optimizer
 for g in rp + fp:
@@ -295,7 +396,7 @@ for g in rp + fp:
         p.requires_grad_(True)
 optimizer = torch.optim.AdamW(rp + fp, lr=BEST_LR, weight_decay=1e-2)
 
-TOTAL_STEPS = 300000
+TOTAL_STEPS = ARGS.steps
 def warmup_cosine(step):
     if step < BEST_WARMUP:
         return step / max(1, BEST_WARMUP)
@@ -475,8 +576,17 @@ campplus_infer = CAMPPlus(feat_dim=80, embedding_size=192)
 campplus_infer.load_state_dict(torch.load(CAMPPLUS_PATH, map_location="cpu", weights_only=True))
 campplus_infer = campplus_infer.cuda().eval()
 
-SOURCE = "/root/autodl-tmp/train/wav/SSB0005/SSB00050001.wav"
-TARGET = "/root/autodl-tmp/train/wav/SSB0009/SSB00090001.wav"
+# Pick first two different speakers from manifest for inference test
+_test_entries = read_jsonl(os.path.join(ARGS.output_dir, "manifest.jsonl"))
+_test_spks = {}
+for _e in _test_entries:
+    if _e.speaker_id not in _test_spks:
+        _test_spks[_e.speaker_id] = _e.audio_path
+    if len(_test_spks) >= 2:
+        break
+_test_paths = list(_test_spks.values())
+SOURCE = _test_paths[0]
+TARGET = _test_paths[1] if len(_test_paths) > 1 else _test_paths[0]
 
 src_audio, _ = librosa.load(SOURCE, sr=16000)
 tgt_audio, _ = librosa.load(TARGET, sr=16000)
